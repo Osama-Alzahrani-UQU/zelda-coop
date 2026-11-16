@@ -11,6 +11,10 @@ assets/trailer/
 *.avi
 *.mkv
 
+# Private notes
+SOCIAL_POSTS*.md
+*.secret
+
 # Windows
 Thumbs.db
 [Ee]xcluded/
