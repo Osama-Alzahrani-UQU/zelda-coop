@@ -1,0 +1,17 @@
+# Build artifacts
+build/obj/
+*.o
+*.obj
+*.tmp
+*.log
+
+# Media
+*.mp4
+assets/trailer/
+*.avi
+*.mkv
+
+# Windows
+Thumbs.db
+[Ee]xcluded/
+.vscode/
