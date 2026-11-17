@@ -1,4 +1,5 @@
 #include "dialogs.h"
+#include "framegen.h"
 
 #include <algorithm>
 #include <mutex>
@@ -15,6 +16,14 @@ std::vector<int> g_counts;
 std::vector<FriendEntry> g_friends;
 std::string g_give_item, g_give_label;
 int g_give_have = 0;
+// (Give To, quick: the item, then how many, then the player (none to choose with one other player); the gift goes as soon
+// as it is taken: no second question)
+int g_give_amount = 1;
+std::vector<std::pair<uint32_t, int>> g_preset;   // (gifts on their way: the amount chosen before they were offered)
+bool give_quantity(const std::string& pouch);
+void give_choose_amount();
+void give_to_player(int slot);
+void give_choose_player();
 std::vector<int> g_player_slots;   // (the Give To players' list: their slots)
 std::vector<uint32_t> g_handled;   // (gifts already prompted)
 bool g_game_press = false;          // (the item menu's first row: the game's own A, given back once)
@@ -86,6 +95,16 @@ void build_settings_rows() {
         g_v.rows.push_back({"Motion smoothing", smooth[std::clamp(g.smoothing, 0, 3)], "How the other players' movement is smoothed over the network's jitter.", false});
         g_v.rows.push_back({"Notice sounds", on_off(g.sounds), "A sound for joins, invitations and gifts.", false});
         g_v.rows.push_back({"Auto-save", on_off(g.autosave), "Your game saves itself every 3 minutes while you play online, so nothing is lost.", false});
+        // (Co-op Frame Generation: the mod's own setup of the renderer's frame generation; only with the game's own Off)
+        const int game_fg = game_framegen_option();
+        std::string fg = game_fg != 0 ? std::string("Unavailable") : on_off(g.coop_fg);
+        if (game_fg == 0 && g.coop_fg != coop_framegen_running()) fg += " (next start)";
+        g_v.rows.push_back({"Co-op Frame Generation", fg,
+                            game_fg != 0
+                                ? "Turn the game's own Frame generation Off (Options) to use this one instead."
+                                : "Note: made for NVIDIA cards (RTX 20/30 too). 2x frames, evenly paced on a present thread of "
+                                  "their own, one frame queued for the least input delay. Starts with the game.",
+                            false});
     }
     g_v.sel = std::min<int>(g_v.sel, (int)g_v.rows.size() - 1);
 }
@@ -122,6 +141,16 @@ void settings_change(int dir, bool press_a) {
         case 6: g.smoothing = (g.smoothing + (dir < 0 ? 3 : 1)) % 4; break;
         case 7: g.sounds = !g.sounds; break;
         case 8: g.autosave = !g.autosave; break;
+        case 9:
+            if (game_framegen_option() != 0) {
+                Session::get().toast("Turn the game's own Frame generation Off first", 2);
+                return;
+            }
+            g.coop_fg = !g.coop_fg;
+            Session::get().toast(g.coop_fg == coop_framegen_running() ? std::string("Co-op Frame Generation as it is now")
+                                 : g.coop_fg ? std::string("Co-op Frame Generation starts the next time the game starts")
+                                             : std::string("Co-op Frame Generation stops the next time the game starts"), 0);
+            break;
         }
     }
     config_save();
@@ -192,8 +221,53 @@ void build_ingame_rows() {
 }
 }  // namespace
 
+namespace {
+bool give_quantity(const std::string& pouch) {
+    for (const auto& it : giftable_items())
+        if (it.pouch == pouch) return it.quantity;
+    return false;
+}
+
+// (how many: for things counted and more than one had; else one, straight to the player)
+void give_choose_amount() {
+    g_give_amount = 1;
+    if (!give_quantity(g_give_item) || g_give_have <= 1) {
+        give_choose_player();
+        return;
+    }
+    g_v.kind = kDlgGiftAmount;
+    g_v.gift = 0;   // (0: chosen before the offer)
+    g_v.title = "How many?";
+    g_v.text = "How many " + g_give_label + " to give?";
+    g_v.amount_max = g_give_have;
+    g_v.amount = g_give_item == "Rupees" ? std::min(g_give_have, 50) : std::min(g_give_have, 10);
+}
+
+void give_to_player(int slot) {
+    const SessionView v = Session::get().view();
+    const uint32_t id = Session::get().gift_offer(slot, g_give_item, g_give_label, g_give_have);
+    g_v = DialogsView{};
+    if (!id) return;
+    g_preset.push_back({id, std::max(1, g_give_amount)});
+    std::string what = g_give_label;
+    if (give_quantity(g_give_item)) what = std::to_string(std::max(1, g_give_amount)) + " " + g_give_label;
+    Session::get().toast("Giving " + what + " to " + (slot >= 0 && slot < kMaxPlayers ? v.players[slot].name : std::string("them")), 0);
+}
+
+void give_choose_player() {
+    build_give_players();
+    if (g_player_slots.size() == 1) {   // (only one other player: to them)
+        give_to_player(g_player_slots[0]);
+        return;
+    }
+    g_v.kind = kDlgGivePlayer;
+    g_v.title = "Give " + g_give_label + " to";
+}
+}  // namespace
+
 const std::vector<Item>& giftable_items() {
     static const std::vector<Item> items = {
+        {"Rupees", "Rupees", true},
         {"Deku Sticks", "Item_DekuStick", true},   {"Deku Nuts", "Item_DekuNut", true},
         {"Bombs", "Item_Bomb", true},              {"Bombchus", "Item_Bombchu", true},
         {"Deku Seeds", "Item_DekuSeed", true},     {"Arrows", "Item_Arrow_Normal", true},
@@ -355,6 +429,13 @@ void dialogs_gifts_update(const std::vector<Gift>& gifts, int me) {
             g_v.text = (g.from >= 0 && g.from < kMaxPlayers ? v.players[g.from].name : std::string("A player")) +
                        " wants to give you " + g.label + ".";
             g_v.rows = {{"Accept", "", "", false}, {"Decline", "", "", false}};
+        } else if (g.from == me && g.state == kGiftAccepted &&
+                   std::find_if(g_preset.begin(), g_preset.end(), [&](const auto& p) { return p.first == g.id; }) != g_preset.end()) {
+            g_handled.push_back(g.id);
+            auto it = std::find_if(g_preset.begin(), g_preset.end(), [&](const auto& p) { return p.first == g.id; });
+            Session::get().gift_send(g.id, std::min(it->second, std::max(1, g.have)));
+            g_preset.erase(it);
+            if (g_v.kind == kDlgWaiting && g_v.gift == g.id) g_v = DialogsView{};
         } else if (g.from == me && g.state == kGiftAccepted && (g_v.kind == kDlgNone || g_v.kind == kDlgWaiting)) {
             g_handled.push_back(g.id);
             g_v = DialogsView{};
@@ -431,11 +512,15 @@ void dialogs_input(uint64_t raw, uint64_t pressed, int32_t stick[4]) {
         if (pressed & kR) g_v.amount = std::min(g_v.amount_max, g_v.amount + 10);
         if (pressed & kL) g_v.amount = std::max(1, g_v.amount - 10);
         if (pressed & kA) {
+            if (g_v.gift == 0) {   // (chosen before the offer: now the player)
+                g_give_amount = g_v.amount;
+                give_choose_player();
+                return;
+            }
             Session::get().gift_send(g_v.gift, g_v.amount);
-            if (pause_menu_open()) Session::get().toast("The gift goes as soon as you close the menu", 0);
             g_v = DialogsView{};
         } else if (pressed & kB) {
-            Session::get().gift_cancel(g_v.gift);
+            if (g_v.gift) Session::get().gift_cancel(g_v.gift);
             g_v = DialogsView{};
         }
         return;
@@ -505,9 +590,7 @@ void dialogs_input(uint64_t raw, uint64_t pressed, int32_t stick[4]) {
                     g_give_item = pouch, g_give_label = items[i].label;
                     g_give_have = i < g_counts.size() ? g_counts[i] : 0;
                 }
-            g_v.kind = kDlgGivePlayer;
-            g_v.title = "Give " + g_give_label + " to";
-            build_give_players();
+            give_choose_amount();
         }
         if (pressed & kB) g_v = DialogsView{};
         break;
@@ -528,9 +611,7 @@ void dialogs_input(uint64_t raw, uint64_t pressed, int32_t stick[4]) {
                     Session::get().toast(std::string("You have no ") + g_give_label + " to give", 2);
                     break;
                 }
-                g_v.kind = kDlgGivePlayer;
-                g_v.title = "Give " + g_give_label + " to";
-                build_give_players();
+                give_choose_amount();
             } else {
                 g_v = DialogsView{};
             }
@@ -538,16 +619,7 @@ void dialogs_input(uint64_t raw, uint64_t pressed, int32_t stick[4]) {
         if (pressed & kB) g_v = DialogsView{};
         break;
     case kDlgGivePlayer:
-        if ((pressed & kA) && g_v.sel < (int)g_player_slots.size()) {
-            const uint32_t id = Session::get().gift_offer(g_player_slots[(size_t)g_v.sel], g_give_item, g_give_label, g_give_have);
-            g_v = DialogsView{};
-            if (id) {
-                g_v.kind = kDlgWaiting;
-                g_v.gift = id;
-                g_v.title = "Give To";
-                g_v.text = "Waiting for an answer...";
-            }
-        }
+        if ((pressed & kA) && g_v.sel < (int)g_player_slots.size()) give_to_player(g_player_slots[(size_t)g_v.sel]);
         if (pressed & kB) g_v.kind = kDlgGiveItem, g_v.title = "Give To: choose an item", build_give_items();
         break;
     case kDlgGiftOffer:

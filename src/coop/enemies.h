@@ -16,6 +16,6 @@ void enemies_hit(uint64_t actor, uint32_t before, uint32_t after);
 // (developer test: a hit of that much life on that enemy (its GameActor), taken and sent as the life hook would)
 void enemies_hit_test(uint64_t ga, int amount);
 // (a hit from another game: that much life taken from this game's copy; owner and id: the enemy as its game knows it)
-void enemies_take_hit(const std::string& map, const std::string& name, const float home[3], int amount, int owner, uint32_t id);
+void enemies_take_hit(Ctx* c, const std::string& map, const std::string& name, const float home[3], int amount, int owner, uint32_t id);
 
 }  // namespace coop

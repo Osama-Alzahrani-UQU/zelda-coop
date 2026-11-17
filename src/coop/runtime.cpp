@@ -1,6 +1,7 @@
 ﻿#include "runtime.h"
 #include "fellow.h"
 
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -88,6 +89,51 @@ int hook_is_player(Ctx* c, uint64_t actor) {
     // (Link's own life going down: held when the hit would end it in a session, and while he is down)
     if (is && after < before && c->x[13] == r64(actor + 7184) + 8 && fellow_guard_life(before, after)) return 1;
     return real && is;
+}
+
+// The game's PauseMgr (*(0x84eb7e38)): named pause reasons, each with a request count (entries at +8, 0x20 each, sorted
+// by name hash: the hash at +8, the count at +0x1c) and the request f_80b1ba60(manager + 0x48, hash, on) its callers make
+// after counting. The pause menu (and the map) ask "GamePause", which stops the whole world. Online with other players,
+// a world that stops for one player while the others fight in it would go out of step with theirs: so there the menu asks
+// "EventDisableController" instead (what the game's own events use to take the player's control): the world goes on, the
+// player's Link stands still while the menu is up, as in online games.
+constexpr uint32_t kGamePause = 0xba597383u, kControllerPause = 0xd468c7d1u;
+std::atomic<int> g_pause_turned{0};   // (GamePause requests turned into the controller's)
+
+uint64_t pause_entry(uint64_t mgr, uint32_t hash) {
+    const uint32_t n = r32(mgr);
+    const uint64_t arr = r64(mgr + 8);
+    if (!n || n > 256 || arr < kHeapBase) return 0;
+    for (uint32_t i = 0; i < n; i++)
+        if (r32(arr + 0x20 * (uint64_t)i + 8) == hash) return arr + 0x20 * (uint64_t)i;
+    return 0;
+}
+
+void hook_pause_request(Ctx* c) {
+    const uint32_t hash = (uint32_t)c->x[1];
+    const bool on = (uint32_t)c->x[2] != 0;
+    const uint64_t mgr = c->x[0] - 0x48;
+    if (hash == kGamePause) {
+        const uint64_t game = pause_entry(mgr, kGamePause), ctl = pause_entry(mgr, kControllerPause);
+        if (on && game && ctl && coop_online_together()) {
+            // (counted by the caller: its count back, the controller's up, and that asked instead)
+            InterlockedExchange((volatile LONG*)gp(game + 0x1c), 0);
+            InterlockedIncrement((volatile LONG*)gp(ctl + 0x1c));
+            g_pause_turned++;
+            c->x[1] = kControllerPause;
+            g_rt.orig_pause_request(c);
+            return;
+        }
+        if (!on && g_pause_turned.load() > 0 && ctl) {
+            g_pause_turned--;
+            if ((int32_t)r32(ctl + 0x1c) > 0) InterlockedDecrement((volatile LONG*)gp(ctl + 0x1c));
+            const uint64_t x0 = c->x[0], x2 = c->x[2];
+            c->x[1] = kControllerPause, c->x[2] = 0;
+            g_rt.orig_pause_request(c);
+            c->x[0] = x0, c->x[1] = kGamePause, c->x[2] = x2;
+        }
+    }
+    g_rt.orig_pause_request(c);
 }
 
 // hos_oot_flight_pose(c, actor, matrix): a mover's matrix just made by its movement (3 x 4 rows; nx2/oot_patches.py
@@ -188,6 +234,8 @@ bool runtime_init() {
         !hook((void*)t.find("hos_oot_is_player"), (void*)hook_is_player, (void**)&g_rt.orig_is_player, "hos_oot_is_player")) {
         MH_DisableHook((void*)t.find("hos_oot_hearts_enabled"));   // (both or neither: the guard's meaning kept)
     }
+    if (g_rt.a64_lookup)   // (the pause menu online: the world goes on)
+        hook((void*)g_rt.a64_lookup(0x80b1ba60ULL), (void*)hook_pause_request, (void**)&g_rt.orig_pause_request, "PauseMgr request");
     g_rt.exe_ready = ok;
     return ok;
 }

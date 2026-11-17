@@ -225,6 +225,31 @@ void draw_online_info(Ui& u) {
          fit(u.body, 13 * u.s, radmin ? "Friends on your Radmin VPN network find your games." : "Join a Radmin VPN network with your friends.", pw - 30 * u.s));
 }
 
+// (the host's start: what Continue loads, and how friends come in)
+void draw_host_start(Ui& u) {
+    static std::string newest;
+    static int64_t next = 0;
+    if (now_ns() >= next) {
+        next = now_ns() + 1000000000LL;
+        const auto saves = list_saves();
+        newest = saves.empty() ? std::string("No save yet") : saves[0].location + "  (" + saves[0].when + ")";
+    }
+    const float x0 = u.w * 0.745f, pw = u.w - x0 - 18 * u.s, ph = 176 * u.s;
+    const float y0 = u.h * 0.5f - 130 * u.s;
+    box(u, ImVec2(x0, y0), ImVec2(x0 + pw, y0 + ph), 0.92f);
+    banner(u, ImVec2(x0, y0), ImVec2(x0 + pw, y0 + 38 * u.s), "Host a Game");
+    float y = y0 + 52 * u.s;
+    text(u, u.body, 16 * u.s, x0 + 18 * u.s, y, kDim, "Continue");
+    y += 22 * u.s;
+    text(u, u.strong, 16 * u.s, x0 + 18 * u.s, y, kWhite, fit(u.strong, 16 * u.s, newest, pw - 36 * u.s));
+    y += 34 * u.s;
+    text(u, u.body, 13 * u.s, x0 + 16 * u.s, y, fade(kDim, 0.85f),
+         fit(u.body, 13 * u.s, "The game starts at once. Friends who join", pw - 30 * u.s));
+    y += 18 * u.s;
+    text(u, u.body, 13 * u.s, x0 + 16 * u.s, y, fade(kDim, 0.85f),
+         fit(u.body, 13 * u.s, "come straight into your world, with their own items.", pw - 30 * u.s));
+}
+
 void draw_join(Ui& u) {
     const auto servers = Session::get().servers();
     const float x0 = u.w * 0.745f, pw = u.w - x0 - 18 * u.s, ph = 120 * u.s + std::max<size_t>(1, servers.size()) * 58 * u.s;
@@ -425,10 +450,8 @@ void smoothed(const Player& p, int smoothing, float out[3]) {
 }
 
 
-// ---- the other players in the world. The game's own Link cannot be added to its world yet (an actor asked of its manager
-// is made but never placed), so each other player is drawn where they are: a figure of Link in his colours, sized as he
-// is (a child 1.3 m, an adult 1.8 m), turned as he faces, his steps as he moves, lying on his side when down.
-// Moved without delay: the newest state carried forward by the speed it shows (up to 150 ms), then eased toward that.
+// ---- the other players' places as the overlay follows them (their nameplates): each one is the game's own Link in the
+// world (puppet.cpp); the newest state carried forward by the speed it shows (up to 150 ms), then eased toward that.
 struct Shown {
     bool init = false;
     uint32_t seq = 0;
@@ -474,105 +497,6 @@ void update_shown(int i, const Player& p, int smoothing) {
     s.init = true;
 }
 
-// a point of the figure (x right, y up, z forward, in heights) placed in the world: lying turns it onto its side first
-void figure_point(const Shown& s, float height, float x, float y, float z, float out[3]) {
-    const float a = s.down * 1.5708f, ca = cosf(a), sa = sinf(a);
-    const float lx = x * ca - y * sa, ly = x * sa + y * ca;   // (roll about the forward axis)
-    const float wx = lx * height, wy = ly * height + s.down * 0.12f, wz = z * height;
-    const float c = cosf(s.yaw), sn = sinf(s.yaw);
-    out[0] = s.pos[0] + wx * c + wz * sn;
-    out[1] = s.pos[1] + wy;
-    out[2] = s.pos[2] - wx * sn + wz * c;
-}
-
-void draw_figure(Ui& u, const CameraView& cam, const Shown& s, bool child, float alpha) {
-    const float H = child ? 1.3f : 1.8f;
-    const float focal = 0.5f * u.h / tanf(cam.fovy * 0.5f);
-    const float speed = std::min(sqrtf(s.vel[0] * s.vel[0] + s.vel[2] * s.vel[2]) / 3.0f, 1.0f) * (1.0f - s.down);
-    const float swing = sinf(s.phase) * 0.55f * speed;
-    struct Seg {
-        float a[3], b[3];   // (figure units)
-        float width;        // (heights)
-        ImU32 col;
-        float depth = 0;
-        ImVec2 pa, pb;
-        float wa = 0, wb = 0;
-        bool ok = false;
-    };
-    const ImU32 tunic = rgba(52, 128, 46), tunic_dark = rgba(40, 100, 36), skin = rgba(238, 196, 156), hair = rgba(236, 196, 88),
-                tights = rgba(232, 222, 196), boot = rgba(96, 62, 32), belt = rgba(110, 72, 36), hat = rgba(58, 138, 48);
-    const float leg_f = sinf(swing) * 0.22f, leg_up = (1 - cosf(swing)) * 0.22f;
-    std::vector<Seg> segs = {
-        // legs (hip -> foot), swinging
-        {{-0.07f, 0.46f, 0}, {-0.07f, 0.05f + leg_up, leg_f}, 0.075f, tights},
-        {{0.07f, 0.46f, 0}, {0.07f, 0.05f + leg_up * 0.0f, -leg_f}, 0.075f, tights},
-        {{-0.07f, 0.16f + leg_up, leg_f * 0.75f}, {-0.07f, 0.03f + leg_up, leg_f + 0.03f}, 0.095f, boot},
-        {{0.07f, 0.16f, -leg_f * 0.75f}, {0.07f, 0.03f, -leg_f + 0.03f}, 0.095f, boot},
-        // the tunic: skirt and chest
-        {{0, 0.36f, 0}, {0, 0.50f, 0}, 0.30f, tunic_dark},
-        {{0, 0.48f, 0}, {0, 0.73f, 0}, 0.23f, tunic},
-        {{0, 0.49f, 0.005f}, {0, 0.52f, 0.005f}, 0.235f, belt},
-        // arms (shoulder -> hand), swinging against the legs
-        {{-0.15f, 0.70f, 0}, {-0.18f, 0.46f, -leg_f * 0.8f}, 0.065f, tunic},
-        {{0.15f, 0.70f, 0}, {0.18f, 0.46f, leg_f * 0.8f}, 0.065f, tunic},
-        {{-0.18f, 0.48f, -leg_f * 0.8f}, {-0.185f, 0.43f, -leg_f * 0.85f}, 0.06f, skin},
-        {{0.18f, 0.48f, leg_f * 0.8f}, {0.185f, 0.43f, leg_f * 0.85f}, 0.06f, skin},
-        // neck, head, hair, the hat falling back
-        {{0, 0.72f, 0}, {0, 0.77f, 0}, 0.07f, skin},
-        {{0, 0.84f, 0.01f}, {0, 0.845f, 0.01f}, 0.215f, skin},
-        {{0, 0.87f, -0.03f}, {0, 0.88f, -0.035f}, 0.22f, hair},
-        {{0, 0.90f, -0.01f}, {0, 0.93f, -0.06f}, 0.19f, hat},
-        {{0, 0.93f, -0.06f}, {0, 0.88f, -0.18f}, 0.13f, hat},
-        {{0, 0.88f, -0.18f}, {0, 0.78f, -0.27f}, 0.07f, hat},
-    };
-    for (auto& g : segs) {
-        float wa[3], wb[3], da, db;
-        figure_point(s, H, g.a[0], g.a[1], g.a[2], wa);
-        figure_point(s, H, g.b[0], g.b[1], g.b[2], wb);
-        if (!project(cam, wa, u.w, u.h, &g.pa.x, &g.pa.y, &da) || !project(cam, wb, u.w, u.h, &g.pb.x, &g.pb.y, &db)) continue;
-        g.depth = (da + db) * 0.5f;
-        g.wa = g.width * H * focal / std::max(da, 0.3f);
-        g.wb = g.width * H * focal / std::max(db, 0.3f);
-        g.ok = true;
-    }
-    // (the face toward the camera: the hat and the hair behind it are drawn first; farther parts first)
-    std::stable_sort(segs.begin(), segs.end(), [](const Seg& x, const Seg& y) { return x.depth > y.depth; });
-    // (a soft shadow on the ground)
-    {
-        float g0[3], sx, sy, sd;
-        g0[0] = s.pos[0], g0[1] = s.pos[1] + 0.02f, g0[2] = s.pos[2];
-        if (project(cam, g0, u.w, u.h, &sx, &sy, &sd)) {
-            const float r = 0.28f * H * focal / std::max(sd, 0.3f);
-            u.d->AddEllipseFilled(ImVec2(sx, sy), ImVec2(r * (1.0f + s.down * 1.4f), r * 0.32f), fade(rgba(0, 0, 0, 120), alpha), 0, 20);
-        }
-    }
-    for (int pass = 0; pass < 2; pass++) {
-        for (const auto& g : segs) {
-            if (!g.ok) continue;
-            const float w = (g.wa + g.wb) * 0.5f;
-            const ImU32 col = pass == 0 ? fade(rgba(24, 16, 8, 230), alpha) : fade(g.col, alpha);
-            const float grow = pass == 0 ? std::max(1.5f, w * 0.12f) * 2 : 0;
-            u.d->AddLine(g.pa, g.pb, col, w + grow);
-            u.d->AddCircleFilled(g.pa, (w + grow) * 0.5f, col, 16);
-            u.d->AddCircleFilled(g.pb, (w + grow) * 0.5f, col, 16);
-        }
-    }
-    // (the eyes when he faces the camera)
-    float head[3], fwd[3], hx, hy, hd, fx, fy, fd;
-    figure_point(s, H, 0, 0.845f, 0.10f, fwd);
-    figure_point(s, H, 0, 0.845f, 0.0f, head);
-    if (s.down < 0.5f && project(cam, head, u.w, u.h, &hx, &hy, &hd) && project(cam, fwd, u.w, u.h, &fx, &fy, &fd) && fd < hd - 0.06f) {
-        const float r = 0.016f * H * focal / std::max(hd, 0.3f);
-        const float side = (fx - hx);
-        for (int e = -1; e <= 1; e += 2) {
-            float ep[3], ex, ey, ed;
-            figure_point(s, H, 0.045f * e, 0.85f, 0.105f, ep);
-            if (project(cam, ep, u.w, u.h, &ex, &ey, &ed)) u.d->AddCircleFilled(ImVec2(ex, ey), r, fade(rgba(40, 70, 140), alpha), 10);
-        }
-        (void)side;
-    }
-}
-
 void draw_hud(Ui& u, const SessionView& v, const GuestSettings& gs) {
     const LocalSnapshot me = local_snapshot();
     const float k = gs.hud_scale / 100.0f;
@@ -613,10 +537,7 @@ void draw_hud(Ui& u, const SessionView& v, const GuestSettings& gs) {
             g_shown[i].init = false;
             continue;
         }
-        update_shown(i, p, gs.smoothing);
-        float d[3] = {g_shown[i].pos[0] - me.pos[0], g_shown[i].pos[1] - me.pos[1], g_shown[i].pos[2] - me.pos[2]};
-        const float away = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-        if (away < 120.0f && !puppet_placed(i)) draw_figure(u, cam, g_shown[i], p.st.child, std::clamp(1.3f - away / 120.0f, 0.3f, 1.0f));
+        update_shown(i, p, gs.smoothing);   // (only the game's own Link shows a player: no drawn stand-in, even for a moment)
     }
     if (!gs.nameplates) return;
     for (int i = 0; i < kMaxPlayers; i++) {
@@ -629,6 +550,7 @@ void draw_hud(Ui& u, const SessionView& v, const GuestSettings& gs) {
         float pos[3] = {g_shown[i].pos[0], g_shown[i].pos[1], g_shown[i].pos[2]};
         bool pchild = p.st.child;
         const bool on_puppet = puppet_position(i, pos, &pchild);   // (the game's Link of that player: his own place)
+        if (!on_puppet) continue;   // (his Link not in this world yet (a map loading, an area changing): no plate in the air)
         const bool down = p.st.flags & kDowned;
         if (down) {
             // (a red ring on the ground round them, beating)
@@ -893,7 +815,20 @@ void overlay_hit_test(int slot) {
     if (slot >= 0 && slot < kMaxPlayers) g_hit_test[slot] = true;
 }
 
+// (steady: once something wanted the overlay, it is kept for a while, so a frame or two without the game's update (a
+// hitch, an event starting) does not make the mod's pictures blink off and on)
+bool overlay_wanted_now();
 bool overlay_wanted() {
+    static std::atomic<int64_t> last{0};
+    const int64_t now = now_ns();
+    if (overlay_wanted_now()) {
+        last = now;
+        return true;
+    }
+    return now - last.load() < 700000000LL;
+}
+
+bool overlay_wanted_now() {
     if (dialogs_open() || menus_modal()) return true;
     if (fellow_downed() || fellow_revive_target(nullptr) >= 0) return true;
     const int save = game_save_state();
@@ -939,6 +874,7 @@ void overlay_draw(ImGuiContext* ctx, uint32_t w, uint32_t h) {
     if (on_title) {
         switch (mv.page) {
         case Page::Online: draw_online_info(u); break;
+        case Page::HostStart: draw_host_start(u); break;
         case Page::Join: draw_join(u); break;
         case Page::HostLobby:
         case Page::GuestLobby: draw_lobby(u, v, mv); break;
@@ -947,13 +883,16 @@ void overlay_draw(ImGuiContext* ctx, uint32_t w, uint32_t h) {
         if (mv.page != Page::Title && mv.page != Page::Loading && mv.page != Page::AutoLoad && mv.page != Page::PickFile)
             prompts_br(u, {{"A", "OK"}, {"B", "Back"}});
     }
-    if (mv.page == Page::Loading || mv.page == Page::AutoLoad) {
+    if ((mv.page == Page::Loading || mv.page == Page::AutoLoad) && !mv.hide_loading) {
         MenuView lv = mv;
         if (mv.page == Page::AutoLoad) lv.loading_text = "Starting the game...";
         draw_loading(u, lv);
     }
     if (v.role != Role::None) draw_map_markers(u, v), draw_world_markers(u, v);
-    if (game_in_play() && v.role != Role::None) {
+    // (in play, steadily: the game's update missing for a moment (a hitch, a short event) keeps the list and the plates)
+    static int64_t play_seen = 0;
+    if (game_in_play() && !pause_menu_open()) play_seen = now_ns();
+    if (now_ns() - play_seen < 600000000LL && v.role != Role::None) {
         draw_hud(u, v, gs);
         draw_downed(u);
         draw_revive_prompt(u, v);

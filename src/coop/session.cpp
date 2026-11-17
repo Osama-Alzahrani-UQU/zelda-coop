@@ -24,10 +24,11 @@ enum Kind : uint8_t { kReliable = 0, kUnreliable = 1, kAckOnly = 2, kDiscovery =
 enum Msg : uint8_t {
     M_HELLO = 1, M_WELCOME, M_REJECT, M_LOBBY, M_READY, M_START, M_STATE, M_PING, M_PONG, M_BYE, M_TOAST,
     M_GIFT_OFFER, M_GIFT_REPLY, M_GIFT_SEND, M_GIFT_DONE, M_KILL, M_KICK, M_SAVE_ALL, M_REVIVE, M_RESPAWN, M_POSE, M_STARTER, M_GEAR, M_ENEMY, M_EHIT, M_WFLAG,
+    M_WORLD_ASK, M_WORLD_PIECE, M_ITEMS_KEEP, M_ITEMS_BACK, M_OBJHIT,
     M_BEACON = 100, M_PRESENCE, M_INVITE
 };
 constexpr int kHeader = 20;
-constexpr char kModVersion[] = "1.0.0";
+constexpr char kModVersion[] = "1.1.0";
 constexpr int64_t kTimeoutMs = 7000;
 
 struct Pending {
@@ -86,6 +87,28 @@ struct Session::Impl {
     std::map<uint32_t, Gift> gifts;
     std::vector<KillEvent> kills;       // (the host: every kill of the session, for players who join later)
     std::vector<WorldFlag> world_in;    // (placed objects' state changed in the others' games, not taken yet)
+    // (the host's save for a guest: the guests that asked; the saves on their way, a piece at a time as the connection
+    // takes them; a guest: the save as it comes)
+    std::vector<int> world_asks;
+    struct WorldOut {
+        int to = -1;
+        uint32_t xfer = 0;
+        std::vector<uint8_t> file[2];
+        int f = 0;
+        uint32_t at = 0;
+    };
+    std::vector<WorldOut> world_out;
+    struct WorldIn {
+        uint32_t xfer = 0;
+        bool none = false;
+        std::vector<uint8_t> file[2];
+        std::vector<uint8_t> got[2];
+        uint32_t total[2] = {0, 0}, have[2] = {0, 0};
+        bool sized[2] = {false, false};
+    } world;
+    std::vector<std::pair<std::string, std::string>> items_kept;   // (the host: guests' items to keep, by name)
+    std::string items_back;                                        // (a guest: its own items, from the host)
+    bool items_back_new = false;
     std::vector<KillEvent> new_kills;   // (the others' kills, for this game to carry out)
     std::atomic<int> n_new_kills{0};
     std::atomic<bool> respawn_asked{false};   // (for the game: forget the kills not done yet)
@@ -201,6 +224,8 @@ struct Session::Impl {
         w.str(k.actor);
         for (float v : k.home) w.f32(v);
         w.str(k.map);
+        if (k.has_spawn)
+            for (float v : k.spawn) w.f32(v);
         return w.buf;
     }
     void on_respawn(const std::string& who) {
@@ -346,6 +371,11 @@ struct Session::Impl {
         gifts.clear();
         kills.clear();
         new_kills.clear();
+        world_asks.clear();
+        world_out.clear();
+        world = WorldIn{};
+        items_kept.clear();
+        items_back_new = false;
         n_new_kills = 0;
         save_seen = 0;
         status.clear();
@@ -453,6 +483,16 @@ struct Session::Impl {
             if (role != Role::Host) return;
             const std::string nm = r.str(), pw = r.str(), ver = r.str();
             const int slot = c.slot;
+            if (ver != kModVersion) {   // (another version of the mod: its messages are not the same)
+                Writer w;
+                w.u8(M_REJECT);
+                w.str("Different mod versions (host " + std::string(kModVersion) + ", you " + (ver.empty() ? std::string("?") : ver) +
+                      "): install the same Longshot Co-op on both PCs");
+                send_reliable(c, w.buf);
+                flush_some();
+                c = Conn{};
+                return;
+            }
             if (!hs.password.empty() && pw != hs.password) {
                 Writer w;
                 w.u8(M_REJECT);
@@ -481,6 +521,7 @@ struct Session::Impl {
             if (phase == Phase::Playing || phase == Phase::Starting) {
                 Writer s;
                 s.u8(M_START);
+                s.i32(host_file == -2 && phase == Phase::Starting ? -2 : 0);   // (-2: a new game, not begun yet: one too)
                 send_reliable(c, s.buf);
                 // (joining a game in progress: the enemies already defeated stay defeated for them; or, with the host's
                 // option, they come back for everyone: the record forgotten, every game told)
@@ -551,7 +592,10 @@ struct Session::Impl {
         case M_START: {
             if (role != Role::Guest) return;
             phase = Phase::Starting;
-            act({GameAction::StartGame});
+            GameAction a{GameAction::StartGame};
+            a.n = r.i32();   // (-2: a new game, as the host's; else the host's save, asked for)
+            if (!r.ok()) a.n = 0;
+            act(a);
             add_toast("The host started the game", 1);
             break;
         }
@@ -576,14 +620,30 @@ struct Session::Impl {
             p.st = s;
             if (role == Role::Host) to_all(std::vector<uint8_t>(msg, msg + len), false, slot);
             // (a player in the game for the first time: the host's starting gear, for what they do not have yet)
-            if (role == Role::Host && (s.flags & kInPlay) && !p.starter_sent && hs.starter && !starter.empty()) {
+            // (and the host's bags (sticks, nuts, seeds, bombs, arrows, the wallet) whenever they change: without its bag a
+            // game holds none of that kind, a gift and a pick-up refused)
+            if (role == Role::Host && (s.flags & kInPlay) && !starter.empty()) {
+                std::vector<std::pair<std::string, int>> gear, bagv, out;
+                uint32_t bags = 2166136261u;
+                for (const auto& it : starter) {
+                    const bool bag = it.first.find("Bag_") != std::string::npos || it.first.find("Quiver_") != std::string::npos ||
+                                     it.first.find("Wallet_") != std::string::npos;
+                    (bag ? bagv : gear).push_back(it);
+                    if (bag)
+                        for (char ch : it.first) bags = (bags ^ (uint8_t)ch) * 16777619u;
+                }
+                if (!p.starter_sent) out = gear;   // (the gear once, as the player first plays)
+                if (bags != p.bags_sent) out.insert(out.end(), bagv.begin(), bagv.end());   // (the bags as they grow)
+                if (!out.empty()) {
+                    Writer w;
+                    w.u8(M_STARTER);
+                    w.u8((uint8_t)out.size());
+                    for (const auto& [item, n] : out) w.str(item), w.u16((uint16_t)std::clamp(n, 1, 999));
+                    send_reliable(c, w.buf);
+                    log("session: the starting gear and bags (%zu kinds) sent to %s", out.size(), p.name.c_str());
+                }
                 p.starter_sent = true;
-                Writer w;
-                w.u8(M_STARTER);
-                w.u8((uint8_t)starter.size());
-                for (const auto& [item, n] : starter) w.str(item), w.u16((uint16_t)std::clamp(n, 1, 999));
-                send_reliable(c, w.buf);
-                log("session: the starting gear (%zu kinds) sent to %s", starter.size(), p.name.c_str());
+                p.bags_sent = bags;
             }
             break;
         }
@@ -632,6 +692,69 @@ struct Session::Impl {
                 f.value = r.u32();
                 if (from != me && world_in.size() < 8192) world_in.push_back(f);
             }
+            if (role == Role::Host) to_all(std::vector<uint8_t>(msg, msg + len), true, from);
+            break;
+        }
+        case M_WORLD_ASK: {   // (a guest wants the host's save)
+            if (role != Role::Host || c.slot <= 0 || !players[c.slot].used) return;
+            if (std::find(world_asks.begin(), world_asks.end(), c.slot) == world_asks.end()) world_asks.push_back(c.slot);
+            world_out.erase(std::remove_if(world_out.begin(), world_out.end(), [&](const WorldOut& o) { return o.to == c.slot; }),
+                            world_out.end());
+            log("session: %s asked for the host's world", players[c.slot].name.c_str());
+            break;
+        }
+        case M_WORLD_PIECE: {   // (a piece of the host's save: file 0 the caption, 1 the progress, 2 none)
+            if (role != Role::Guest) return;
+            const uint32_t xfer = r.u32();
+            const uint8_t f = r.u8();
+            const uint32_t total = r.u32(), at = r.u32();
+            const uint16_t n = r.u16();
+            if (!r.ok() || f > 2) return;
+            if (xfer != world.xfer) world = WorldIn{}, world.xfer = xfer;
+            if (f == 2) {
+                world.none = true;
+                break;
+            }
+            if (total > (8u << 20) || n > r.left() || (uint64_t)at + n > total || (at % 1024) != 0) return;
+            if (!world.sized[f] || world.total[f] != total) {
+                world.sized[f] = true;
+                world.total[f] = total, world.have[f] = 0;
+                world.file[f].assign(total, 0);
+                world.got[f].assign((total + 1023) / 1024, 0);
+            }
+            const uint32_t piece = at / 1024;
+            if (piece < world.got[f].size() && !world.got[f][piece]) {
+                r.raw(world.file[f].data() + at, n);
+                world.got[f][piece] = 1;
+                world.have[f] += n;
+            }
+            break;
+        }
+        case M_ITEMS_KEEP: {   // (a guest's items, for the host to keep under its name)
+            if (role != Role::Host || c.slot <= 0 || !players[c.slot].used) return;
+            const std::string list = r.str();
+            if (!r.ok() || list.size() > 8000) return;
+            if (items_kept.size() < 32) items_kept.push_back({players[c.slot].name, list});
+            break;
+        }
+        case M_ITEMS_BACK: {   // (this guest's own items, kept by the host)
+            if (role != Role::Guest) return;
+            const std::string list = r.str();
+            if (!r.ok()) return;
+            items_back = list, items_back_new = true;
+            log("session: the host gave back this player's items (%zu bytes)", list.size());
+            break;
+        }
+        case M_OBJHIT: {   // (a blow on a placed object in another game: the same object here)
+            const int from = r.u8();
+            GameAction a{GameAction::ObjectHit};
+            const std::string mp = r.str(), nm = r.str();
+            a.key = r.u64();
+            a.n = r.u16();
+            if (!r.ok() || from >= kMaxPlayers || !a.key || a.n <= 0) return;
+            if (role == Role::Host && from != c.slot) return;
+            a.s = mp + '\n' + nm;
+            if (from != me) act(a);
             if (role == Role::Host) to_all(std::vector<uint8_t>(msg, msg + len), true, from);
             break;
         }
@@ -733,6 +856,10 @@ struct Session::Impl {
             k.actor = r.str();
             for (float& v : k.home) v = r.f32();
             k.map = r.str();
+            if (r.ok() && r.left() >= 12) {
+                for (float& v : k.spawn) v = r.f32();
+                k.has_spawn = r.ok();
+            }
             if (!r.ok() || !k.id) return;
             log("session: a kill from slot %d: %s in %s", c.slot, k.actor.c_str(), k.map.c_str());
             if (role == Role::Host) {
@@ -906,6 +1033,39 @@ struct Session::Impl {
                 }
             }
             if (c.ack_due && now - c.last_send_ms >= 15) send_raw(c, kAckOnly, 0, {});
+        }
+        for (auto it = world_out.begin(); it != world_out.end();) {
+            Conn* c = conn_of_slot(it->to);
+            if (!c) {
+                it = world_out.erase(it);
+                continue;
+            }
+            int room = 48 - (int)c->unacked.size();
+            if (it->file[0].empty() && it->file[1].empty()) {   // (no save: the guest starts a new game)
+                Writer w;
+                w.u8(M_WORLD_PIECE);
+                w.u32(it->xfer), w.u8(2), w.u32(0), w.u32(0), w.u16(0);
+                send_reliable(*c, w.buf);
+                it = world_out.erase(it);
+                continue;
+            }
+            while (room-- > 0 && it->f < 2) {
+                const std::vector<uint8_t>& file = it->file[it->f];
+                const uint32_t n = std::min<uint32_t>(1024, (uint32_t)file.size() - it->at);
+                Writer w;
+                w.u8(M_WORLD_PIECE);
+                w.u32(it->xfer), w.u8((uint8_t)it->f), w.u32((uint32_t)file.size()), w.u32(it->at), w.u16((uint16_t)n);
+                w.raw(file.data() + it->at, n);
+                send_reliable(*c, w.buf);
+                it->at += n;
+                if (it->at >= file.size()) it->f++, it->at = 0;
+            }
+            if (it->f >= 2) {
+                log("session: the host's world sent to %s", players[it->to].name.c_str());
+                it = world_out.erase(it);
+            } else {
+                ++it;
+            }
         }
         if (role == Role::Guest && phase == Phase::Connecting && now - join_started_ms > 6000) {
             add_toast("No answer from the host", 2);
@@ -1113,6 +1273,7 @@ void Session::start_game() {
     d->phase = Phase::Starting;
     Writer w;
     w.u8(M_START);
+    w.i32(d->host_file == -2 ? -2 : 0);   // (-2: a new game: the guests start one too; else they ask for the host's save)
     d->to_all(w.buf, true);
     d->act({GameAction::StartGame});
     d->next_lobby = 0;
@@ -1230,6 +1391,17 @@ void Session::send_enemy_hit(const std::string& map, const std::string& name, co
     w.u8(owner >= 0 && owner < kMaxPlayers ? (uint8_t)owner : 0xff), w.u32(id);
     d->to_all(w.buf, true);
 }
+void Session::send_object_hit(const std::string& map, const std::string& name, uint64_t placement, int amount) {
+    std::lock_guard<std::mutex> lock(d->m);
+    if (d->role == Role::None || d->me < 0 || amount <= 0 || !placement) return;
+    Writer w;
+    w.u8(M_OBJHIT);
+    w.u8((uint8_t)d->me);
+    w.str(map), w.str(name);
+    w.u64(placement);
+    w.u16((uint16_t)std::min(amount, 65535));
+    d->to_all(w.buf, true);
+}
 void Session::push_gear(const std::string& gear) {
     std::lock_guard<std::mutex> lock(d->m);
     if (d->role == Role::None || gear == d->local_gear) return;
@@ -1259,6 +1431,79 @@ void Session::send_world_flags(const std::string& map, const std::vector<WorldFl
         for (size_t i = at; i < at + n; i++) w.u64(flags[i].key), w.u32(flags[i].value);
         d->to_all(w.buf, true);
     }
+}
+void Session::request_world() {
+    std::lock_guard<std::mutex> lock(d->m);
+    if (d->role != Role::Guest || !d->conns[0].used) return;
+    d->world = Impl::WorldIn{};
+    Writer w;
+    w.u8(M_WORLD_ASK);
+    d->send_reliable(d->conns[0], w.buf);
+}
+bool Session::take_world_request(int* slot) {
+    std::lock_guard<std::mutex> lock(d->m);
+    while (d->role == Role::Host && !d->world_asks.empty()) {
+        *slot = d->world_asks.front();
+        d->world_asks.erase(d->world_asks.begin());
+        if (*slot > 0 && *slot < kMaxPlayers && d->players[*slot].used) return true;
+    }
+    return false;
+}
+void Session::send_world(int to, const std::vector<uint8_t>& caption, const std::vector<uint8_t>& progress) {
+    std::lock_guard<std::mutex> lock(d->m);
+    if (d->role != Role::Host || to <= 0 || to >= kMaxPlayers || !d->players[to].used) return;
+    Impl::WorldOut o;
+    o.to = to;
+    o.xfer = random_u32();
+    if (!caption.empty() && !progress.empty()) o.file[0] = caption, o.file[1] = progress;
+    d->world_out.push_back(std::move(o));
+    log("session: the host's world (%zu + %zu bytes) on its way to %s", caption.size(), progress.size(), d->players[to].name.c_str());
+}
+int Session::take_world(std::vector<uint8_t>* caption, std::vector<uint8_t>* progress, int* percent) {
+    std::lock_guard<std::mutex> lock(d->m);
+    auto& w = d->world;
+    if (w.none) {
+        w = Impl::WorldIn{};
+        return -1;
+    }
+    const uint64_t total = (uint64_t)w.total[0] + w.total[1], have = (uint64_t)w.have[0] + w.have[1];
+    if (percent) *percent = total && w.sized[1] ? (int)(have * 100 / total) : 0;
+    if (!w.sized[0] || !w.sized[1] || w.have[0] < w.total[0] || w.have[1] < w.total[1]) return 0;
+    *caption = std::move(w.file[0]), *progress = std::move(w.file[1]);
+    w = Impl::WorldIn{};
+    return 1;
+}
+void Session::send_items(const std::string& list) {
+    std::lock_guard<std::mutex> lock(d->m);
+    if (d->role != Role::Guest || !d->conns[0].used) return;
+    Writer w;
+    w.u8(M_ITEMS_KEEP);
+    w.str(list);
+    d->send_reliable(d->conns[0], w.buf);
+}
+bool Session::take_items_kept(std::string* name, std::string* list) {
+    std::lock_guard<std::mutex> lock(d->m);
+    if (d->items_kept.empty()) return false;
+    *name = d->items_kept.front().first, *list = d->items_kept.front().second;
+    d->items_kept.erase(d->items_kept.begin());
+    return true;
+}
+void Session::send_items_back(int to, const std::string& list) {
+    std::lock_guard<std::mutex> lock(d->m);
+    if (d->role != Role::Host) return;
+    if (Conn* c = d->conn_of_slot(to)) {
+        Writer w;
+        w.u8(M_ITEMS_BACK);
+        w.str(list);
+        d->send_reliable(*c, w.buf);
+    }
+}
+bool Session::take_items_back(std::string* list) {
+    std::lock_guard<std::mutex> lock(d->m);
+    if (!d->items_back_new) return false;
+    d->items_back_new = false;
+    *list = d->items_back;
+    return true;
 }
 std::vector<WorldFlag> Session::take_world_flags() {
     std::lock_guard<std::mutex> lock(d->m);

@@ -10,7 +10,7 @@
 
 namespace coop {
 
-enum class Page { Title, Name, Online, Join, HostLobby, GuestLobby, Settings, PickFile, Loading, AutoLoad };
+enum class Page { Title, Name, Online, Join, HostLobby, GuestLobby, Settings, PickFile, Loading, AutoLoad, HostStart };
 
 // Buttons as the game reads them (B_* bits of host/nn_hid.c)
 enum : uint64_t {
@@ -33,6 +33,7 @@ struct MenuView {
     std::string loading_text;
     int64_t loading_since = 0;
     bool name_editing = false;
+    bool hide_loading = false;      // (the game's own question is up: the player answers it)
 };
 MenuView menus_view();
 Page menus_page();   // (cheap: the page alone)
@@ -63,6 +64,8 @@ struct SaveInfo {
 std::vector<SaveInfo> list_saves();
 // When the newest of them was written (a FILETIME; 0 none): the files' times only, for the end of a save
 int64_t newest_save_time();
+// the player's save folder (the account's, under the --user folder or the game's user folder); empty: none yet
+std::wstring save_account_dir();
 // (the game closing or the session ending in the pause menu: the menu closed as its Back does, so the game's save can run)
 void menus_close_pause();
 

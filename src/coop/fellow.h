@@ -19,6 +19,12 @@ uint64_t game_actor_life(uint64_t ga);               // the address of its life 
 
 // ---- kills (game threads)
 void fellow_enemy_died(uint64_t body);               // (the life hook: an actor's life reached 0 in this game)
+// an enemy brought down as by a blow of the game's own (its death, its loot), not sent to the others (a kill of theirs
+// carried out here): false when its body takes no life message
+bool fellow_kill_actor(Ctx* c, uint64_t ga);
+// a change of an actor's life as the game's own (change < 0 a blow: the actor reacts to it as to a hit, at its body's next
+// update): false when its body takes no life message
+bool fellow_life_message(Ctx* c, uint64_t ga, int change);
 // Link's update: the others' kills carried out here, the fall and the revive (player: Link's body, mover: his GameActor)
 void fellow_update(Ctx* c, uint64_t player, uint64_t mover, const char* map, bool child, bool loading, bool event, int64_t now);
 void fellow_revived(int from);                       // (the session: another player revived this one)

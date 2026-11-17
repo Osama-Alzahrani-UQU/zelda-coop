@@ -60,6 +60,8 @@ const char* world_area_of(const char* map);
 // The pouch, on a game thread with its context (Link's update, a menu's): one content's count by its actor name (-1: not
 // ready), and an add (delta > 0) or a removal (the event's status, -1 not ready)
 int pouch_count(Ctx* c, const char* name);
+int item_count(Ctx* c, const char* name);   // (a pouch content's count; "Rupees": the wallet's)
+int item_change(Ctx* c, const char* name, int delta);   // (a pouch content added or removed; "Rupees": the wallet's)
 // An AS (animation sequence) played on an actor by its name (Link's: AS/Player_Child.root.asb); keep: nothing done when it
 // is already the one playing. On a game thread with its context.
 bool game_play_as(Ctx* c, uint64_t actor, const char* name, float rate, bool keep);
