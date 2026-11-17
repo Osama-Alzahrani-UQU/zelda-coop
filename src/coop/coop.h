@@ -19,6 +19,7 @@ void game_actor_damaged(Ctx* c, uint64_t actor, uint32_t before, uint32_t after,
 struct GameAction;
 void game_queue_action(const GameAction& a);        // (the session's: done at Link's next update)
 bool pause_menu_open();                             // the game's pause menu is up
+bool coop_online_together();                        // (a session with another player in it: the world must not stop)
 uint64_t pause_menu_screen();                       // its screen object (0: not up)
 std::string pause_focused_item(bool* equipment);    // the item its Items or Equipment page points at ("" none)
 std::string menu_screens_seen();                    // (research: the menu screens updated lately)

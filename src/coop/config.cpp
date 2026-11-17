@@ -54,10 +54,11 @@ void load(Config& c) {
     getb("hud", c.guest.hud);
     getb("far_names", c.guest.far_names);
     geti("hud_scale", c.guest.hud_scale, 60, 160);
-    getb("gift_prompt", c.guest.gift_prompt);
+    getb("gift_prompt2", c.guest.gift_prompt);   // (a new name: gifts are taken at once unless asked again)
     getb("sounds", c.guest.sounds);
     geti("smoothing", c.guest.smoothing, 0, 3);
     getb("autosave", c.guest.autosave);
+    getb("coop_frame_generation", c.guest.coop_fg);
 }
 }  // namespace
 
@@ -80,10 +81,11 @@ void config_save() {
                "start_with_host=%d\nport=%u\n",
             c.host.server.c_str(), c.host.password.c_str(), c.host.max_players, c.host.join_in_progress, c.host.share_kills,
             c.host.gifts, c.host.same_age, c.host.start_with_host, c.host.port);
-    fprintf(f, "nameplates=%d\nhud=%d\nfar_names=%d\nhud_scale=%d\ngift_prompt=%d\nsounds=%d\nsmoothing=%d\n", c.guest.nameplates,
+    fprintf(f, "nameplates=%d\nhud=%d\nfar_names=%d\nhud_scale=%d\ngift_prompt2=%d\nsounds=%d\nsmoothing=%d\n", c.guest.nameplates,
             c.guest.hud, c.guest.far_names, c.guest.hud_scale, c.guest.gift_prompt, c.guest.sounds, c.guest.smoothing);
     fprintf(f, "revive=%d\nrespawn_for_new=%d\nautosave=%d\nstarter=%d\n", c.host.revive, c.host.respawn_for_new, c.guest.autosave,
             c.host.starter);
+    fprintf(f, "coop_frame_generation=%d\n", c.guest.coop_fg);
     fclose(f);
 }
 

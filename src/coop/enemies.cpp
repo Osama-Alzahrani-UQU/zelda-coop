@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -362,9 +363,31 @@ void enemies_update(Ctx* c, uint64_t mover, const char* map, bool loading, int64
 }
 
 namespace {
+// (hits that came from another game, given here as the game's own blows: the life hook sees them; not sent back)
+struct Muted {
+    uint64_t ga;
+    int amount;
+    int64_t until;
+};
+std::mutex g_muted_mutex;
+std::vector<Muted> g_muted;
+
+bool muted_hit(uint64_t ga, int amount) {
+    std::lock_guard<std::mutex> lock(g_muted_mutex);
+    const int64_t now = now_ns();
+    g_muted.erase(std::remove_if(g_muted.begin(), g_muted.end(), [&](const Muted& m) { return now > m.until; }), g_muted.end());
+    for (auto it = g_muted.begin(); it != g_muted.end(); ++it)
+        if (it->ga == ga && it->amount == amount) {
+            g_muted.erase(it);
+            return true;
+        }
+    return false;
+}
+
 void hit_sent(uint64_t ga, int amount) {
     Session& ses = Session::get();
     if (!ses.active() || !ses.others_present() || !ga || amount <= 0) return;
+    if (muted_hit(ga, amount)) return;
     const std::string name = game_actor_name(ga);
     if (name.rfind("Enemy_", 0) != 0) return;
     const LocalSnapshot snap = local_snapshot();
@@ -396,7 +419,7 @@ void enemies_hit_test(uint64_t ga, int amount) {
     hit_sent(ga, amount);
 }
 
-void enemies_take_hit(const std::string& map, const std::string& name, const float home[3], int amount, int owner, uint32_t id) {
+void enemies_take_hit(Ctx* c, const std::string& map, const std::string& name, const float home[3], int amount, int owner, uint32_t id) {
     const LocalSnapshot snap = local_snapshot();
     if (!snap.valid || map != snap.map || amount <= 0) return;
     PlayerState st[kMaxPlayers], prev[kMaxPlayers];
@@ -427,9 +450,18 @@ void enemies_take_hit(const std::string& map, const std::string& name, const flo
     if (!life) return;
     const int was = (int)r32(life);
     if (was <= 0) return;
-    const int now_life = std::max(1, was - amount);   // (its death comes as a kill)
-    InterlockedExchange((volatile LONG*)gp(life), now_life);
-    log("enemies: %s (player %d's enemy) hit in another game: life %d -> %d (%s)", name.c_str(), owner, was, now_life, how);
+    const int take = std::min(amount, was - 1);   // (its death comes as a kill)
+    if (take <= 0) return;
+    // (as a blow of the game's own: the enemy reacts here as it does there (its flinch, its knock-back), seen by the
+    // player who struck it when this game leads it; the life hook sees it: not sent back)
+    {
+        std::lock_guard<std::mutex> lock(g_muted_mutex);
+        g_muted.push_back({ga, take, now_ns() + 3000000000LL});
+    }
+    const bool blow = fellow_life_message(c, ga, -take);
+    if (!blow) InterlockedExchange((volatile LONG*)gp(life), was - take);
+    log("enemies: %s (player %d's enemy) hit in another game: life %d -> %d (%s%s)", name.c_str(), owner, was, was - take, how,
+        blow ? ", as a blow" : "");
 }
 
 }  // namespace coop

@@ -48,6 +48,7 @@ struct Runtime {
     void (*orig_flight_pose)(Ctx* c, uint64_t actor, uint64_t matrix) = nullptr;
     int (*orig_hearts_enabled)() = nullptr;
     int (*orig_is_player)(Ctx* c, uint64_t actor) = nullptr;
+    void (*orig_pause_request)(Ctx* c) = nullptr;   // (the game's PauseMgr request, f_80b1ba60, as lifted)
     bool exe_ready = false, vk_ready = false;
 };
 

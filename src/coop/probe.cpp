@@ -217,6 +217,13 @@ void run_line(Ctx* c, const std::string& line) {
         // ehit GAMEACTOR N: a hit of N on that enemy, taken and shared as the life hook does (enemies.cpp)
         enemies_hit_test(strtoull(t[1].c_str(), nullptr, 16), atoi(t[2].c_str()));
         log("probe: ehit %s %s", t[1].c_str(), t[2].c_str());
+    } else if (t[0] == "ekill" && t.size() >= 2) {
+        // ekill GAMEACTOR: that enemy brought down by a blow of the game's own (a life message), as another game's kill is
+        log("probe: ekill %s %s", t[1].c_str(), fellow_kill_actor(c, strtoull(t[1].c_str(), nullptr, 16)) ? "sent" : "not taken");
+    } else if (t[0] == "eblow" && t.size() >= 3) {
+        // eblow GAMEACTOR N: a blow of N on that enemy as the game's own (seen by the life hook: shared as a player's hit is)
+        log("probe: eblow %s %s %s", t[1].c_str(), t[2].c_str(),
+            fellow_life_message(c, strtoull(t[1].c_str(), nullptr, 16), -atoi(t[2].c_str())) ? "sent" : "not taken");
     } else if (t[0] == "hurt" && t.size() >= 2) {
         // hurt SLOT: that player's nameplate shows a hit, as when their life goes down
         overlay_hit_test(atoi(t[1].c_str()));

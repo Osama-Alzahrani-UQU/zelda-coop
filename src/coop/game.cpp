@@ -11,6 +11,7 @@
 #include <mutex>
 
 #include "coop.h"
+#include "coopsave.h"
 #include "dialogs.h"
 #include "enemies.h"
 #include "world.h"
@@ -206,7 +207,7 @@ void update_counts(Ctx* c, int64_t now) {
     int64_t due = next.load();
     if (!dialogs_open() || now < due || !next.compare_exchange_strong(due, now + 500000000LL)) return;
     std::vector<int> counts;
-    for (const Item& it : giftable_items()) counts.push_back(pouch_count(c, it.pouch));
+    for (const Item& it : giftable_items()) counts.push_back(item_count(c, it.pouch));
     dialogs_set_counts(counts);
 }
 
@@ -269,20 +270,202 @@ std::string read_gear(Ctx* c) {
     return out;
 }
 
-// the starting gear the host shares with players who join (the game's own first weapons and items): the host's game says
-// what it has every 2 s; a joining player's game takes each one it has none of
+// ---- the bags: this game holds no Deku Sticks, Nuts, Seeds, Bombs or Arrows (0 of 0) until it has their bag (the first
+// stick bundle, the seed bag with the slingshot...): Item_StickBag_Small and its kind. A gift or a pick-up of those before
+// it is refused by the game. So a player in a session gets the bags the host has (as the starting gear goes), and a gift
+// of something whose bag this game lacks brings the smallest bag first. The wallets are the rupees' bags.
+struct BagKind {
+    const char* item;
+    const char* bags[3];   // (small, medium, large; the wallet's small one is everyone's from the start)
+};
+const BagKind kBags[] = {
+    {"Item_DekuStick", {"Item_StickBag_Small", "Item_StickBag_Medium", "Item_StickBag_Large"}},
+    {"Item_DekuNut", {"Item_NutBag_Small", "Item_NutBag_Medium", "Item_NutBag_Large"}},
+    {"Item_DekuSeed", {"Item_BulletBag_Small", "Item_BulletBag_Medium", "Item_BulletBag_Large"}},
+    {"Item_Bomb", {"Item_BombBag_Small", "Item_BombBag_Medium", "Item_BombBag_Large"}},
+    {"Item_Arrow_Normal", {"Item_Quiver_Small", "Item_Quiver_Medium", "Item_Quiver_Large"}},
+    {"Rupees", {nullptr, "Item_Wallet_Medium", "Item_Wallet_Large"}},
+};
+
+const BagKind* bag_kind_of(const std::string& item) {
+    for (const BagKind& k : kBags)
+        if (item == k.item) return &k;
+    return nullptr;
+}
+// (a bag's kind and its size, 1..3)
+const BagKind* bag_of(const std::string& name, int* level) {
+    for (const BagKind& k : kBags)
+        for (int i = 0; i < 3; i++)
+            if (k.bags[i] && name == k.bags[i]) {
+                *level = i + 1;
+                return &k;
+            }
+    return nullptr;
+}
+// (the biggest bag of a kind this game has: 0 none, -1 the pouch not ready)
+int bag_level(Ctx* c, const BagKind& k) {
+    for (int i = 2; i >= 0; i--) {
+        if (!k.bags[i]) return 1;   // (the first wallet)
+        const int n = pouch_count(c, k.bags[i]);
+        if (n < 0) return -1;
+        if (n > 0) return i + 1;
+    }
+    return 0;
+}
+
+// ---- rupees: the pouch's own (OneshotIncreaseRupee, f_82982fc0): the count f_80a87c30(pouch, 1), the wallet's size
+// f_80a876a0(pouch), a change f_833c6d70(pouch, delta, 7); the pouch *(*0x84e98e28)
+constexpr uint64_t kPouchSlot = 0x84e98e28ULL, kFnRupees = 0x80a87c30ULL, kFnRupeeMax = 0x80a876a0ULL, kFnRupeeAdd = 0x833c6d70ULL;
+int rupees(Ctx* c) {
+    const uint64_t pouch = r64(kPouchSlot);
+    if (pouch < kHeapBase || !rt().a64_lookup(kFnRupees)) return -1;
+    return (int)(int32_t)guest_call(c, kFnRupees, pouch, 1);
+}
+int rupees_change(Ctx* c, int delta) {   // (what really moved: the wallet holds what it can)
+    const uint64_t pouch = r64(kPouchSlot);
+    const int had = rupees(c);
+    if (had < 0 || !rt().a64_lookup(kFnRupeeAdd) || !rt().a64_lookup(kFnRupeeMax)) return 0;
+    const int max = (int)(int32_t)guest_call(c, kFnRupeeMax, pouch);
+    const int to = std::clamp(had + delta, 0, std::max(max, had));
+    if (to == had) return 0;
+    guest_call(c, kFnRupeeAdd, pouch, (uint64_t)(int64_t)(to - had), 7);
+    return rupees(c) - had;
+}
+}  // namespace
+
+int item_count(Ctx* c, const char* name) {
+    if (!strcmp(name, "Rupees")) return rupees(c);
+    return pouch_count(c, name);
+}
+
+int item_change(Ctx* c, const char* name, int delta) {
+    if (!strcmp(name, "Rupees")) return rupees_change(c, delta);
+    return pouch_change(c, name, delta);
+}
+
+namespace {
+// ---- the items the session moves into or out of this game: a gift's add or removal, the host's starting gear and bags.
+// The pouch takes a change at its next update, in play and in the pause menu alike; what really moved is read back (the
+// game may hold fewer: a bag full). A Deku Stick (and its kind) going to a game without its bag brings the bag first.
+std::string item_label(const std::string& pouch);
+
+struct Moving {
+    uint64_t key;
+    std::string item;
+    bool add;
+    int had, n;
+    int64_t until;
+};
+std::vector<Moving> g_moving;
+
+bool item_action(const GameAction& a) {
+    return a.kind == GameAction::AddItem || a.kind == GameAction::RemoveItem || a.kind == GameAction::Starter;
+}
+
+void item_actions(Ctx* c, int64_t now) {
+    Session& ses = Session::get();
+    {
+        GameAction a;
+        while (ses.pop_action(&a))
+            if (a.kind != GameAction::StartGame) game_queue_action(a);
+    }
+    std::deque<GameAction> mine;
+    {
+        std::lock_guard<std::mutex> lock(g_actions_mutex);
+        std::deque<GameAction> rest;
+        for (const GameAction& a : g_actions) (item_action(a) ? mine : rest).push_back(a);
+        g_actions.swap(rest);
+    }
+    std::string starter_got;
+    for (GameAction a : mine) {
+        const bool add = a.kind != GameAction::RemoveItem;
+        // (its bag first, when this game has none: the action again at the next update, the bag taken by then)
+        if (add) {
+            int want_level = 0;
+            const BagKind* kind = bag_of(a.s, &want_level);
+            if (kind) {   // (a bag from the host: when this game's is smaller)
+                const int level = bag_level(c, *kind);
+                if (level < 0) {
+                    game_queue_action(a);
+                    continue;
+                }
+                if (level < want_level) {
+                    const int status = pouch_change(c, a.s.c_str(), 1);
+                    log("bags: %s from the host (this game's was size %d; event status %d)", a.s.c_str(), level, status);
+                    if (status >= 0) starter_got += (starter_got.empty() ? "" : ", ") + std::string(a.s.find("Wallet") != std::string::npos ? "a bigger wallet" : "a bag");
+                }
+                continue;
+            }
+            if (const BagKind* need = bag_kind_of(a.s); need && need->bags[0]) {
+                const int level = bag_level(c, *need);
+                if (level == 0 && a.pos[2] < 40) {
+                    if (a.pos[2] == 0) log("bags: %s needs %s first: given", a.s.c_str(), need->bags[0]), pouch_change(c, need->bags[0], 1);
+                    a.pos[2] += 1;
+                    game_queue_action(a);
+                    continue;
+                }
+            }
+        }
+        const int have = item_count(c, a.s.c_str());
+        if (have < 0) {   // (the pouch not ready yet)
+            if (a.pos[1] < 600) a.pos[1] += 1, game_queue_action(a);
+            continue;
+        }
+        if (a.kind == GameAction::Starter) {
+            const int status = have == 0 ? pouch_change(c, a.s.c_str(), a.n) : -1;
+            log("starter: %s x%d (had %d, event status %d)", a.s.c_str(), a.n, have, status);
+            if (status >= 0) {
+                g_moving.push_back({0, a.s, true, 0, a.n, now + 1200000000LL});
+                starter_got += (starter_got.empty() ? "" : ", ") + item_label(a.s);
+            }
+            continue;
+        }
+        int status = -1;
+        if (a.n > 0 && (add || have >= a.n)) {
+            if (a.s == "Rupees") status = 0, rupees_change(c, add ? a.n : -a.n);
+            else status = pouch_change(c, a.s.c_str(), add ? a.n : -a.n);
+        }
+        log("gift: %s %s %d (had %d, event status %d)", add ? "add" : "remove", a.s.c_str(), a.n, have, status);
+        if (status < 0) {
+            if (a.key) ses.gift_result((uint32_t)a.key, false, 0);
+            continue;
+        }
+        g_moving.push_back({a.key, a.s, add, have, a.n, now + 1200000000LL});
+    }
+    for (auto it = g_moving.begin(); it != g_moving.end();) {
+        const int count = item_count(c, it->item.c_str());
+        const int moved = count < 0 ? 0 : std::max(0, std::min(it->n, it->add ? count - it->had : it->had - count));
+        if (moved < it->n && now < it->until) {
+            ++it;
+            continue;
+        }
+        log("gift: %s %s: %d of %d (now %d)", it->add ? "added" : "removed", it->item.c_str(), moved, it->n, count);
+        if (it->key) ses.gift_result((uint32_t)it->key, moved > 0, moved);
+        it = g_moving.erase(it);
+    }
+    if (!starter_got.empty()) ses.toast("From the host: " + starter_got, 1);
+}
+
+// the starting gear the host shares with players who join (the game's own first weapons and items), with the bags the
+// host has (always: without them nothing of their kind can be held): the host's game says what it has every 2 s; a
+// player's game takes each one it has none of (a bag: when its own is smaller), again whenever the host's list changes
 const char* const kStarterGear[] = {"Weapon_Sword_Kokiri", "Weapon_Shield_Deku", "Weapon_Range_SlingShot",
                                     "Item_DekuStick",      "Item_DekuNut",       "Item_DekuSeed"};
 
 void starter_tick(Ctx* c, int64_t now, const SessionView& v) {
     static int64_t next = 0;
-    if (now < next || v.role != Role::Host || !v.host.starter) return;
+    if (now < next || v.role != Role::Host) return;
     next = now + 2000000000LL;
     std::vector<std::pair<std::string, int>> have;
-    for (const char* item : kStarterGear) {
-        const int n = pouch_count(c, item);
-        if (n > 0) have.push_back({item, n});
+    for (const BagKind& k : kBags) {
+        const int level = bag_level(c, k);
+        if (level > 0 && k.bags[level - 1]) have.push_back({k.bags[level - 1], 1});
     }
+    if (v.host.starter)
+        for (const char* item : kStarterGear) {
+            const int n = pouch_count(c, item);
+            if (n > 0) have.push_back({item, n});
+        }
     Session::get().set_starter(have);
 }
 
@@ -426,7 +609,7 @@ void save_update(Ctx* c, int64_t now, bool loading) {
         // (this player down: Link's life is held at none until a revive or the give-up; a save now would keep that life and
         // the game would load into its Game Over: the save waits, and a while after, for the give-up's map change to start
         // (a save asked as it starts is not written))
-        if (fellow_downed() || now < hold_until) {
+        if (fellow_downed() || now < hold_until || (g_save_quiet.load() && pause_menu_open())) {
             g_save_at = now;
             return;
         }
@@ -473,6 +656,7 @@ void save_unpause(int64_t now) {
     static std::atomic<int64_t> next{0};
     int64_t due = next.load();
     if (now < due || !next.compare_exchange_strong(due, now + 400000000LL)) return;
+    if (g_save_quiet.load()) return;   // (an autosave waits for the menu to be closed by the player: it is not shut on them)
     dialogs_close();
     menus_close_pause();
 }
@@ -548,11 +732,16 @@ void game_actor_damaged(Ctx* c, uint64_t actor, uint32_t before, uint32_t after,
                 (unsigned long long)r64(actor + 24), (unsigned long long)r64(actor + 32));
     }
     if (!player && after < before && after != 0) enemies_hit(actor, before, after);   // (the same life taken in the others)
+    if (!player && after < before) world_object_hit(actor, before, after);   // (grass cut, a switch struck: in the others')
     if (player || after != 0 || before == 0) return;
     fellow_enemy_died(actor);   // (an enemy down here: down in the others' games too)
 }
 
 bool pause_menu_open() { return now_ns() - g_pause_ns.load() < 250000000LL; }
+bool coop_online_together() {
+    Session& ses = Session::get();
+    return ses.active() && ses.others_present();
+}
 uint64_t pause_menu_screen() { return pause_menu_open() ? g_pause_screen.load() : 0; }
 
 // The item the pause menu points at, on its Items or Equipment page (the pages hang off the screen's +8 object: Items at
@@ -692,77 +881,31 @@ void game_player_update(Ctx* c, uint64_t mover) {
             if (!gear.empty()) ses.push_gear(gear);
         }
     }
-    // the session's actions: those for the game (gifts) are taken here while in play (the title screen's tick takes them in
-    // the menus; a start that comes in play is not one for here)
-    {
-        GameAction a;
-        while (ses.pop_action(&a))
-            if (a.kind != GameAction::StartGame) game_queue_action(a);
-    }
+    // the session's actions: the items (gifts, the starting gear) are moved at once, here and from the pause menu's update
+    // (the pouch takes them while the game is paused too); the rest here
+    item_actions(c, now);
     std::deque<GameAction> todo;
     {
         std::lock_guard<std::mutex> lock(g_actions_mutex);
-        todo.swap(g_actions);
+        std::deque<GameAction> items;   // (the items asked again for the next update stay queued)
+        for (const GameAction& a : g_actions) (item_action(a) ? items : todo).push_back(a);
+        g_actions.swap(items);
     }
-    // (the pouch takes an add or a removal at its own next update: what really moved is read back a moment later, as the
-    // game may hold fewer: a bag full, or one not had yet)
-    struct Moving {
-        uint64_t key;
-        std::string item;
-        bool add;
-        int had, n;
-        int64_t until;
-    };
-    static std::vector<Moving> moving;
-    std::string starter_got;
     for (const GameAction& a : todo) {
         if (a.kind == GameAction::Revive) fellow_revived(a.n);
         if (a.kind == GameAction::SaveNow) game_save_now("the host saved", true);
+        if (a.kind == GameAction::ObjectHit) {   // (a blow on a placed object in another game)
+            const size_t cut = a.s.find('\n');
+            if (cut != std::string::npos) world_take_object_hit(c, a.s.substr(0, cut), a.s.substr(cut + 1), a.key, a.n);
+            continue;
+        }
         if (a.kind == GameAction::EnemyHit) {   // (a hit on a shared enemy in another game)
             const size_t cut = a.s.find('\n');
             if (cut != std::string::npos)
-                enemies_take_hit(a.s.substr(0, cut), a.s.substr(cut + 1), a.pos, a.n, (int)(a.key >> 32), (uint32_t)a.key);
+                enemies_take_hit(c, a.s.substr(0, cut), a.s.substr(cut + 1), a.pos, a.n, (int)(a.key >> 32), (uint32_t)a.key);
             continue;
         }
-        if (a.kind == GameAction::Starter) {
-            // (the host's starting gear: taken when this game has none of it; asked again while the pouch is not ready)
-            const int have = pouch_count(c, a.s.c_str());
-            if (have < 0) {
-                game_queue_action(a);
-                continue;
-            }
-            const int status = have == 0 ? pouch_change(c, a.s.c_str(), a.n) : -1;
-            log("starter: %s x%d (had %d, event status %d)", a.s.c_str(), a.n, have, status);
-            if (status >= 0) {
-                moving.push_back({0, a.s, true, 0, a.n, now + 1200000000LL});
-                starter_got += (starter_got.empty() ? "" : ", ") + item_label(a.s);
-            }
-            continue;
-        }
-        if (a.kind != GameAction::AddItem && a.kind != GameAction::RemoveItem) continue;
-        const bool add = a.kind == GameAction::AddItem;
-        const int have = pouch_count(c, a.s.c_str());
-        int status = -1;
-        if (have >= 0 && a.n > 0 && (add || have >= a.n)) status = pouch_change(c, a.s.c_str(), add ? a.n : -a.n);
-        log("gift: %s %s %d (had %d, event status %d)", add ? "add" : "remove", a.s.c_str(), a.n, have, status);
-        if (status < 0) {
-            if (a.key) ses.gift_result((uint32_t)a.key, false, 0);
-            continue;
-        }
-        moving.push_back({a.key, a.s, add, have, a.n, now + 1200000000LL});
     }
-    for (auto it = moving.begin(); it != moving.end();) {
-        const int count = pouch_count(c, it->item.c_str());
-        const int moved = count < 0 ? 0 : std::max(0, std::min(it->n, it->add ? count - it->had : it->had - count));
-        if (moved < it->n && now < it->until) {
-            ++it;
-            continue;
-        }
-        log("gift: %s %s: %d of %d (now %d)", it->add ? "added" : "removed", it->item.c_str(), moved, it->n, count);
-        if (it->key) ses.gift_result((uint32_t)it->key, moved > 0, moved);
-        it = moving.erase(it);
-    }
-    if (!starter_got.empty()) ses.toast("Starting gear from the host: " + starter_got, 1);
     // the session as this update needs it (copied ten times a second, not every frame)
     static SessionView v;
     static int64_t next_view = 0;
@@ -843,6 +986,18 @@ void game_player_update(Ctx* c, uint64_t mover) {
     update_counts(c, now);
     starter_tick(c, now, v);
     gifts_tick(now, v.me);
+    // (the host's world for guests that ask; a guest's own items, given back and kept)
+    static int64_t next_world = 0;
+    if (now >= next_world) {
+        next_world = now + 250000000LL;
+        if (v.role == Role::Host) coopsave_host_tick(true);
+    }
+    if (v.role == Role::Guest || v.role == Role::None) coopsave_items_tick(c, now);
+    // (a guest just arrived in the host's world: full hearts, not the host's)
+    if (v.role == Role::Guest && !loading && s.life > 0 && s.life_max > 0 && coopsave_take_arrival()) {
+        InterlockedExchange((volatile LONG*)gp(life + 8), s.life_max);
+        log("coopsave: arrived in the host's world: life %d -> %d", s.life, s.life_max);
+    }
     probe_poll_file();
     probe_run(c, 2);
     probe_pins(2);
@@ -1131,6 +1286,9 @@ void game_menu_update(Ctx* c, uint64_t screen) {
             else dialogs_give_game_press();
         }
         if (now - g_play_ns.load() > 100000000LL) {
+            static int64_t next_world = 0;
+            if (now >= next_world) next_world = now + 250000000LL, coopsave_host_tick(true);
+            item_actions(c, now);   // (gifts move at once, the menu open or not)
             update_counts(c, now);
             static int64_t next_me = 0;
             static int me = -1;

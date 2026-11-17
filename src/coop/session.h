@@ -36,6 +36,7 @@ struct Player {
     int ping = -1;
     PlayerState st, prev;   // the last two, for smooth motion
     bool starter_sent = false;   // (the host: its starting gear sent to this player)
+    uint32_t bags_sent = 0;      // (the host: which of its bags were last sent to this player: a hash)
     std::string gear;            // what their Link wears: "weapon|shield|head|tunic|boots|hands" (the game's actor names)
 };
 
@@ -78,10 +79,11 @@ struct GuestSettings {
     bool hud = true;                // the players' list under the hearts
     bool far_names = true;          // nameplates through walls and from afar
     int hud_scale = 100;            // percent
-    bool gift_prompt = true;        // ask before taking a gift (off: take them at once)
+    bool gift_prompt = false;       // ask before taking a gift (off: take them at once)
     bool sounds = true;             // the menus' sounds for notices
     int smoothing = 2;              // 0 off, 1 light (50 ms), 2 normal (80 ms), 3 strong (120 ms)
     bool autosave = true;           // the game saved every few minutes while in a session
+    bool coop_fg = false;           // Co-op Frame Generation (framegen.h): from the next start, while the game's own is Off
 };
 
 struct Toast {
@@ -104,7 +106,7 @@ enum { kGiftOffered = 1, kGiftAccepted, kGiftDeclined, kGiftSent, kGiftDone, kGi
 
 // Something the game's thread has to do for the session
 struct GameAction {
-    enum Kind { AddItem, RemoveItem, Kill, GoToHost, StartGame, Leave, Revive, SaveNow, Starter, EnemyHit } kind;
+    enum Kind { AddItem, RemoveItem, Kill, GoToHost, StartGame, Leave, Revive, SaveNow, Starter, EnemyHit, ObjectHit } kind;
     std::string s;
     int n = 0;
     uint64_t key = 0;
@@ -137,8 +139,10 @@ struct WorldFlag {
 struct KillEvent {
     uint32_t id = 0;
     std::string actor;
-    float home[3] = {0, 0, 0};
+    float home[3] = {0, 0, 0};    // (where it fell)
     std::string map;
+    bool has_spawn = false;
+    float spawn[3] = {0, 0, 0};   // (where the map placed it: the same in every game)
 };
 
 struct SessionView {
@@ -184,6 +188,19 @@ public:
     // others' games changed, since the last call)
     void send_world_flags(const std::string& map, const std::vector<WorldFlag>& flags);
     std::vector<WorldFlag> take_world_flags();
+    // ---- the host's world for its guests (coopsave.cpp): a guest plays in the host's save, which the host sends to it
+    // (its caption and progress files, in pieces, paced by the connection); the guest's own items are kept by the host
+    void request_world();                                 // (a guest) the host's save, please
+    bool take_world_request(int* slot);                   // (the host) a guest asked for it
+    // (the host) the save to that guest: both files empty: none (the guest starts a new game)
+    void send_world(int to, const std::vector<uint8_t>& caption, const std::vector<uint8_t>& progress);
+    // (a guest) the host's save: 1 every piece came (the files out), 0 still coming (percent: how much came), -1 the host
+    // has none
+    int take_world(std::vector<uint8_t>* caption, std::vector<uint8_t>* progress, int* percent);
+    void send_items(const std::string& list);              // (a guest) what it carries, for the host to keep
+    bool take_items_kept(std::string* name, std::string* list);   // (the host) a guest's items to keep, by its name
+    void send_items_back(int to, const std::string& list); // (the host) a guest's kept items, back to it
+    bool take_items_back(std::string* list);              // (a guest) its own items, kept by the host
     // the players' newest two states (for the game's every frame: no strings copied); false when not in a session
     bool states(PlayerState st[kMaxPlayers], PlayerState prev[kMaxPlayers], bool used[kMaxPlayers], int* me);
     bool take_respawn();                                 // a player joined and the enemies come back for everyone
@@ -194,6 +211,8 @@ public:
     // (a hit on an enemy here: the same life taken from its copies in the others' games)
     // (owner, id: the enemy as the game it comes from knows it; owner -1: this game's own)
     void send_enemy_hit(const std::string& map, const std::string& name, const float home[3], int amount, int owner, uint32_t id);
+    // a blow on a placed object here (grass cut, a switch struck, a web burnt): the same object (its placement) in the others'
+    void send_object_hit(const std::string& map, const std::string& name, uint64_t placement, int amount);
     // (the host's game: its starting gear, each item's pouch name and count, for players who join)
     void set_starter(const std::vector<std::pair<std::string, int>>& have);
 

@@ -1,5 +1,7 @@
 // Longshot Co-op: the mod's start (loaded by the winmm.dll beside bin\longshot.exe, off the loader lock).
 #include "coop.h"
+#include "coopsave.h"
+#include "framegen.h"
 #include "runtime.h"
 
 namespace coop {
@@ -7,6 +9,8 @@ namespace {
 
 DWORD WINAPI start(LPVOID) {
     log("Longshot Co-op starting (game folder %s)", narrow(game_dir()).c_str());
+    coop_framegen_apply();   // (before the renderer starts: it reads its settings once)
+    coopsave_restore("the game started again");   // (closed while it played in a host's world: its own saves back)
     if (!runtime_init()) {
         log("the mod stays off: the runtime is not one it knows");
         return 0;

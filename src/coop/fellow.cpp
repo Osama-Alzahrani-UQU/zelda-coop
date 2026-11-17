@@ -91,25 +91,68 @@ uint64_t game_actor_life(uint64_t ga) {
 }
 
 // ---- kills: this game's
+namespace {
+// (the enemies whose death this game sent, or carried out for another game: one message an enemy (the hook may see its
+// last hit twice), and none back for a kill that came from another game)
+std::mutex g_recent_mutex;
+uint64_t g_recent[64];
+int g_recent_at = 0;
+bool kill_seen(uint64_t ga, bool add) {
+    std::lock_guard<std::mutex> lock(g_recent_mutex);
+    for (uint64_t r : g_recent)
+        if (r == ga) return true;
+    if (add) g_recent[g_recent_at++ % 64] = ga;
+    return false;
+}
+}  // namespace
+
+// The game's own way to change an actor's life: a life message to its body (the body's vtable +0x90, f_82e67f60, as the
+// scripts' OneShotLifeSetOwnLife sends it: x1 the message, +4 its kind 0x46030000, +0x10 the change: +0 the amount, +8
+// flags, 1 the amount). A negative amount is a blow: at the body's next update (f_804bd8c0) it goes through the game's
+// damage as a hit does, so the enemy's own death plays and its loot drops. (Its life written to 0 instead leaves it
+// standing at 0.)
+bool fellow_kill_actor(Ctx* c, uint64_t ga) {
+    if (!heap(ga) || r64(ga) != kGameActorVt) return false;
+    kill_seen(ga, true);   // (its death here is another game's kill: not sent back)
+    return fellow_life_message(c, ga, -100000);
+}
+
+bool fellow_life_message(Ctx* c, uint64_t ga, int change) {
+    constexpr uint64_t kFnLifeMessage = 0x82e67f60ULL;
+    constexpr uint32_t kLifeChange = 0x46030000u;
+    const uint64_t comps = heap(ga) ? r64(ga + 0x270) : 0;
+    if (!heap(comps) || (int)r32(ga + 0x278) <= kBodyComponent) return false;
+    const uint64_t body = r64(comps + 8 * kBodyComponent);
+    if (!heap(body) || r64(body) != kActorBodyVt || r64(body + 24) != ga) return false;
+    if (r64(kActorBodyVt + 0x90) != kFnLifeMessage || !rt().a64_lookup(kFnLifeMessage)) return false;
+    static uint64_t buf = 0;
+    if (!buf) buf = guest_alloc(0x40, 16);
+    if (!buf) return false;
+    w32(buf + 0, 0xffffffffu);
+    w32(buf + 4, kLifeChange);
+    w32(buf + 8, 0xffffffffu);
+    w32(buf + 0xc, 0);
+    w64(buf + 0x10, buf + 0x20);
+    w32(buf + 0x20, (uint32_t)change);
+    w32(buf + 0x24, 0);
+    w32(buf + 0x28, 1);
+    guest_call(c, kFnLifeMessage, body, buf);
+    return true;
+}
+
 void fellow_enemy_died(uint64_t body) {
     Session& ses = Session::get();
     if (!ses.active()) return;
     const uint64_t ga = game_actor_of(body);
     if (!ga) return;
-    {   // (one message an enemy: the hook may see its last hit twice)
-        static std::mutex m;
-        static uint64_t recent[32];
-        static int at = 0;
-        std::lock_guard<std::mutex> lock(m);
-        for (uint64_t r : recent)
-            if (r == ga) return;
-        recent[at++ % 32] = ga;
-    }
+    if (kill_seen(ga, true)) return;
     const std::string name = game_actor_name(ga);
     if (name.rfind("Enemy_", 0) != 0) return;   // (enemies and bosses: not pots, grass or the players)
     KillEvent k;
     k.actor = name;
     game_actor_pos(ga, k.home);
+    for (int i = 0; i < 3; i++) k.spawn[i] = rf(ga + 0x2ec + 4 * (uint64_t)i);
+    k.has_spawn = std::isfinite(k.spawn[0]) && std::isfinite(k.spawn[1]) && std::isfinite(k.spawn[2]);
     k.map = local_snapshot().map;
     if (k.map.empty()) return;
     log("kill: %s at %.1f %.1f %.1f in %s", name.c_str(), k.home[0], k.home[1], k.home[2], k.map.c_str());
@@ -127,6 +170,7 @@ struct Enemy {
     uint64_t ga, life;
     std::string name;
     float pos[3];
+    float spawn[3];
 };
 
 // the enemies alive in this map: the ring of actors from Link's
@@ -140,14 +184,15 @@ std::vector<Enemy> living_enemies(uint64_t mover) {
         if (ga == mover || r64(ga) != kGameActorVt) break;
         const uint64_t s = r64(ga + 0x260);
         if (s < 0x80000000ULL || r32(s) != 0x6d656e45u || r16(s + 4) != 0x5f79) continue;   // ("Enemy_")
-        Enemy e{ga, game_actor_life(ga), game_actor_name(ga), {0, 0, 0}};
+        Enemy e{ga, game_actor_life(ga), game_actor_name(ga), {0, 0, 0}, {0, 0, 0}};
         if (!e.life || (int32_t)r32(e.life) <= 0 || !game_actor_pos(ga, e.pos)) continue;
+        for (int i = 0; i < 3; i++) e.spawn[i] = rf(ga + 0x2ec + 4 * (uint64_t)i);
         out.push_back(std::move(e));
     }
     return out;
 }
 
-void apply_kills(uint64_t mover, const char* map, std::vector<Pending>& pending, int64_t now) {
+void apply_kills(Ctx* c, uint64_t mover, const char* map, std::vector<Pending>& pending, int64_t now) {
     bool here = false;
     for (const auto& p : pending) here |= p.k.map == map;
     if (!here) return;
@@ -161,13 +206,22 @@ void apply_kills(uint64_t mover, const char* map, std::vector<Pending>& pending,
         }
         if (!it->in_map_since) it->in_map_since = now;
         const bool boss = is_boss(it->k.actor);
+        // (the same enemy: placed at the same spot by the map (its spawn, the same in every game); else the nearest of
+        // that name to where it fell there)
         Enemy* best = nullptr;
         float best_d = boss ? 1e9f : kMatchRadius;
-        for (auto& e : enemies) {
-            if (!e.ga || e.name != it->k.actor) continue;
-            const float d = dist(e.pos, it->k.home);
-            if (d < best_d) best_d = d, best = &e;
-        }
+        if (it->k.has_spawn)
+            for (auto& e : enemies)
+                if (e.ga && e.name == it->k.actor && dist(e.spawn, it->k.spawn) < 1.5f) {
+                    best = &e, best_d = dist(e.pos, it->k.home);
+                    break;
+                }
+        if (!best)
+            for (auto& e : enemies) {
+                if (!e.ga || e.name != it->k.actor) continue;
+                const float d = dist(e.pos, it->k.home);
+                if (d < best_d) best_d = d, best = &e;
+            }
         if (!best) {
             if (!it->logged) {
                 it->logged = true;
@@ -185,8 +239,11 @@ void apply_kills(uint64_t mover, const char* map, std::vector<Pending>& pending,
             ++it;
             continue;
         }
-        InterlockedExchange((volatile LONG*)gp(best->life), 0);
-        log("kill: %s fell here too (%.1f m from where it fell there, %.1f m from Link)", best->name.c_str(), best_d, dist(best->pos, me));
+        // (a blow of the game's own: the enemy's death and its loot; its life written to 0 when its body takes none)
+        const bool blow = fellow_kill_actor(c, best->ga);
+        if (!blow) InterlockedExchange((volatile LONG*)gp(best->life), 0);
+        log("kill: %s fell here too (%.1f m from where it fell there, %.1f m from Link)%s", best->name.c_str(), best_d,
+            dist(best->pos, me), blow ? "" : " (its life set)");
         best->ga = 0;   // (taken: another kill of the same name finds another one)
         it = pending.erase(it);
     }
@@ -214,7 +271,6 @@ void get_up(uint64_t player, int life, const char* why) {
 void fellow_revived(int from) { g_revived_by = from; }
 
 void fellow_update(Ctx* c, uint64_t player, uint64_t mover, const char* map, bool child, bool loading, bool event, int64_t now) {
-    (void)c;
     Session& ses = Session::get();
     // ---- the others' kills
     static std::vector<Pending> pending;
@@ -226,7 +282,7 @@ void fellow_update(Ctx* c, uint64_t player, uint64_t mover, const char* map, boo
         for (auto& k : ses.take_kills()) pending.push_back({std::move(k), 0});
         if (pending.size() > 2048) pending.erase(pending.begin(), pending.begin() + 512);
         if (!ses.active()) pending.clear();
-        else if (!pending.empty() && !loading && !event && map[0]) apply_kills(mover, map, pending, now);
+        else if (!pending.empty() && !loading && !event && map[0]) apply_kills(c, mover, map, pending, now);
     }
     // ---- the fall
     const int64_t down = g_down_since.load();

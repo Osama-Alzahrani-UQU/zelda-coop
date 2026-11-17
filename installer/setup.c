@@ -393,6 +393,96 @@ static int do_install(const wchar_t* folder, wchar_t* why, size_t why_cap) {
     return EXIT_DONE;
 }
 
+// (the files of a folder (not its sub-folders), and the folder when it is then empty)
+static void remove_files(const wchar_t* dir) {
+    wchar_t pattern[MAX_PATH];
+    join(pattern, dir, L"*");
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pattern, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            wchar_t f[MAX_PATH];
+            join(f, dir, fd.cFileName);
+            SetFileAttributesW(f, FILE_ATTRIBUTE_NORMAL);
+            DeleteFileW(f);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    RemoveDirectoryW(dir);
+}
+
+static int copy_files(const wchar_t* from, const wchar_t* to) {
+    CreateDirectoryW(to, NULL);
+    wchar_t pattern[MAX_PATH];
+    join(pattern, from, L"*");
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    int ok = 1;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        wchar_t a[MAX_PATH], b[MAX_PATH];
+        join(a, from, fd.cFileName);
+        join(b, to, fd.cFileName);
+        ok &= CopyFileW(a, b, FALSE) != 0;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return ok;
+}
+
+// A player's own saves, set aside by the mod while they played in a host's world (bin\coop\save_backup*: whole.txt the
+// mark that the copy is whole, account.txt the save folder they came from): put back, as the mod does when the player
+// leaves the session. 1 none waiting or all put back, 0 one could not be (it stays where it is)
+static int restore_saves(const wchar_t* coop) {
+    wchar_t pattern[MAX_PATH];
+    join(pattern, coop, L"save_backup*");
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 1;
+    int all = 1;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        wchar_t bak[MAX_PATH], mark[MAX_PATH], acc_file[MAX_PATH];
+        join(bak, coop, fd.cFileName);
+        join(mark, bak, L"whole.txt");
+        join(acc_file, bak, L"account.txt");
+        if (!file_exists(mark)) continue;
+        wchar_t* account = read_text(acc_file, NULL);
+        if (!account || !dir_exists(account)) {
+            free(account);
+            all = 0;
+            continue;
+        }
+        int ok = 1;
+        for (int slot = 0; slot < 32 && ok; slot++) {
+            wchar_t name[16], mine[MAX_PATH], there[MAX_PATH];
+            _snwprintf(name, 16, L"slot_%02d", slot);
+            join(mine, bak, name);
+            join(there, account, name);
+            if (dir_exists(mine)) {
+                remove_files(there);
+                ok = copy_files(mine, there);
+            } else if (dir_exists(there)) {
+                remove_files(there);   // (a slot the host's world made: not the player's)
+            }
+        }
+        free(account);
+        if (ok) {
+            for (int slot = 0; slot < 32; slot++) {
+                wchar_t name[16], mine[MAX_PATH];
+                _snwprintf(name, 16, L"slot_%02d", slot);
+                join(mine, bak, name);
+                if (dir_exists(mine)) remove_files(mine);
+            }
+            remove_files(bak);
+        }
+        all &= ok;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return all;
+}
+
 static int do_uninstall(const wchar_t* folder, int remove_settings, wchar_t* why, size_t why_cap) {
     if (!is_game(folder)) return _snwprintf(why, why_cap, L"Not a Longshot game folder: %ls", folder), EXIT_NOT_GAME;
     if (game_running(folder)) return _snwprintf(why, why_cap, L"Close the game first."), EXIT_RUNNING;
@@ -402,13 +492,29 @@ static int do_uninstall(const wchar_t* folder, int remove_settings, wchar_t* why
     join(loader, bin, L"winmm.dll");
     join(mod, coop, L"LongshotCoop.dll");
     join(backup, bin, L"winmm.dll.before-coop");
+    if (dir_exists(coop) && !restore_saves(coop))
+        return _snwprintf(why, why_cap, L"Your own saves set aside by the mod could not be put back (kept in %ls): nothing removed", coop),
+               EXIT_WRITE;
     if (file_exists(loader) && file_has(loader, "LONGSHOT_COOP", 0) && !DeleteFileW(loader))
         return _snwprintf(why, why_cap, L"Could not remove %ls", loader), EXIT_WRITE;
     if (file_exists(backup) && !file_exists(loader)) MoveFileExW(backup, loader, 0);
     if (file_exists(mod) && !DeleteFileW(mod)) return _snwprintf(why, why_cap, L"Could not remove %ls", mod), EXIT_WRITE;
     if (remove_settings && dir_exists(coop)) {
-        // (the mod's own files only: its settings, logs and test files)
+        // (the mod's own files only: its settings, logs, test files, and the items it kept for the host's guests)
         const wchar_t* patterns[] = {L"coop_settings*.ini", L"coop_log*.txt", L"probe*.txt", L"probe_on"};
+        WIN32_FIND_DATAW pd;
+        wchar_t players[MAX_PATH];
+        join(players, coop, L"players*");
+        HANDLE ph = FindFirstFileW(players, &pd);
+        if (ph != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(pd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                wchar_t d[MAX_PATH];
+                join(d, coop, pd.cFileName);
+                remove_files(d);
+            } while (FindNextFileW(ph, &pd));
+            FindClose(ph);
+        }
         for (int i = 0; i < 4; i++) {
             wchar_t pattern[MAX_PATH];
             join(pattern, coop, patterns[i]);
@@ -430,13 +536,34 @@ static int do_uninstall(const wchar_t* folder, int remove_settings, wchar_t* why
 
 // ---------------------------------------------------------------- the window
 
+#define APP_VERSION L"1.1.0 Beta"
+#define AUTHOR L"Osama-Alzahrani-UQU"
+#define REPO_URL L"https://github.com/Osama-Alzahrani-UQU/zelda-coop"
+#define PROFILE_URL L"https://github.com/Osama-Alzahrani-UQU"
+#define DONATE_URL L"https://paypal.me/onlinerp53"
+
+static HWND g_guide;
+static HFONT g_font_small, g_font_sub;
+static HBRUSH g_brush_band, g_brush_panel, g_brush_window;
+static const COLORREF kBand = RGB(22, 30, 46), kAccent = RGB(232, 188, 92), kBandText = RGB(240, 242, 246),
+                      kBandDim = RGB(168, 178, 196), kPanel = RGB(246, 247, 250), kText = RGB(30, 34, 42), kDim = RGB(96, 104, 118);
+
 static int S(int v) { return MulDiv(v, (int)g_dpi, 96); }
 
 static void make_fonts(void) {
-    if (g_font) DeleteObject(g_font), DeleteObject(g_font_bold), DeleteObject(g_font_title);
+    if (g_font) {
+        DeleteObject(g_font), DeleteObject(g_font_bold), DeleteObject(g_font_title), DeleteObject(g_font_small), DeleteObject(g_font_sub);
+    }
     g_font = CreateFontW(-S(15), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     g_font_bold = CreateFontW(-S(15), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-    g_font_title = CreateFontW(-S(22), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    g_font_title = CreateFontW(-S(28), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    g_font_sub = CreateFontW(-S(15), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    g_font_small = CreateFontW(-S(13), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    if (!g_brush_band) {
+        g_brush_band = CreateSolidBrush(kBand);
+        g_brush_panel = CreateSolidBrush(kPanel);
+        g_brush_window = CreateSolidBrush(RGB(255, 255, 255));
+    }
 }
 
 static void set_status(const wchar_t* text) { SetWindowTextW(g_status, text); }
@@ -445,15 +572,15 @@ static void fill_list(void) {
     SendMessageW(g_list, LB_RESETCONTENT, 0, 0);
     for (int i = 0; i < g_game_count; i++) {
         wchar_t row[MAX_PATH + 64];
-        _snwprintf(row, MAX_PATH + 64, L"%ls   %ls", installed(g_games[i]) ? L"[Installed]" : L"[ ]", g_games[i]);
+        _snwprintf(row, MAX_PATH + 64, L"%ls   %ls", installed(g_games[i]) ? L"[Installed]" : L"[Not installed]", g_games[i]);
         SendMessageW(g_list, LB_ADDSTRING, 0, (LPARAM)row);
     }
     if (g_game_count) SendMessageW(g_list, LB_SETCURSEL, 0, 0);
     const BOOL any = g_game_count > 0;
     EnableWindow(g_install_btn, any);
     EnableWindow(g_uninstall_btn, any);
-    if (!any) set_status(L"Click Browse... to select the folder containing longshot.exe");
-    else set_status(L"Select your game folder, then click Install.");
+    if (!any) set_status(L"No game found yet. Click Browse... and select the folder that contains longshot.exe.");
+    else set_status(L"Select your game folder in the list, then click Install.");
 }
 
 static void browse(HWND owner) {
@@ -462,7 +589,7 @@ static void browse(HWND owner) {
     DWORD opts = 0;
     dlg->lpVtbl->GetOptions(dlg, &opts);
     dlg->lpVtbl->SetOptions(dlg, opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
-    dlg->lpVtbl->SetTitle(dlg, L"Select the folder containing longshot.exe");
+    dlg->lpVtbl->SetTitle(dlg, L"Select the folder that contains longshot.exe");
     if (SUCCEEDED(dlg->lpVtbl->Show(dlg, owner))) {
         IShellItem* item = NULL;
         if (SUCCEEDED(dlg->lpVtbl->GetResult(dlg, &item))) {
@@ -474,10 +601,10 @@ static void browse(HWND owner) {
                     fill_list();
                     for (int i = 0; i < g_game_count; i++)
                         if (!_wcsicmp(g_games[i], game)) SendMessageW(g_list, LB_SETCURSEL, (WPARAM)i, 0);
-                    set_status(L"Folder selected. Click Install to proceed.");
+                    set_status(L"Folder selected. Click Install to add the mod.");
                 } else {
-                    MessageBoxW(owner, L"Please select the folder containing the launcher (longshot.exe).\n\n"
-                                       L"\x064A\x0631\x062C\x0649 \x0627\x062E\x062A\x064A\x0627\x0631 \x0627\x0644\x0645\x062C\x0644\x062F \x0627\x0644\x0630\x064A \x064A\x062D\x062A\x0648\x064A \x0639\x0644\x0649 \x0645\x0634\x063A\x0644 \x0627\x0644\x0644\x0639\x0628\x0629 (longshot.exe).",
+                    MessageBoxW(owner, L"That folder is not a Longshot game folder.\n\n"
+                                       L"Please select the folder that contains longshot.exe (or its bin folder).",
                                 L"Longshot Co-op Setup", MB_ICONWARNING);
                 }
                 CoTaskMemFree(path);
@@ -491,34 +618,36 @@ static void browse(HWND owner) {
 static void act(HWND owner, int install) {
     const int sel = (int)SendMessageW(g_list, LB_GETCURSEL, 0, 0);
     if (sel < 0 || sel >= g_game_count) {
-        set_status(L"Pick a game folder first.");
+        set_status(L"Pick a game folder in the list first.");
         return;
     }
     wchar_t why[MAX_PATH + 128];
     const int r = install ? do_install(g_games[sel], why, MAX_PATH + 128)
                           : do_uninstall(g_games[sel], SendMessageW(g_remove_settings, BM_GETCHECK, 0, 0) == BST_CHECKED, why, MAX_PATH + 128);
     if (r == EXIT_RUNNING) {
-        MessageBoxW(owner, L"The game is currently running from this folder: please close longshot.exe first, then try again.",
-                    L"Longshot Co-op Setup", MB_ICONWARNING);
+        MessageBoxW(owner, L"The game is running from this folder. Close longshot.exe first, then try again.", L"Longshot Co-op Setup",
+                    MB_ICONWARNING);
     }
     fill_list();
     SendMessageW(g_list, LB_SETCURSEL, (WPARAM)sel, 0);
     set_status(why);
     if (r == EXIT_DONE && install)
-        MessageBoxW(owner, L"Longshot Co-op installed successfully!\n"
-                           L"Developer: Osama-Alzahrani-UQU\n"
-                           L"GitHub: https://github.com/Osama-Alzahrani-UQU\n\n"
-                           L"[Important Requirements]\n"
-                           L"1. Radmin VPN: All players MUST join the EXACT SAME network room to play!\n"
-                           L"2. Launcher: Start the game ONLY from longshot.exe (emulators are unsupported).\n"
-                           L"3. Save Sync: All players must be at the exact same location in their saves.\n"
-                           L"4. Beta Notice: Known issues exist and active improvements are underway.",
+        MessageBoxW(owner,
+                    L"Longshot Co-op " APP_VERSION L" is installed.\n"
+                    L"Created by " AUTHOR L"  -  " REPO_URL L"\n\n"
+                    L"Before you play:\n"
+                    L"1. Every player installs the mod and joins the SAME Radmin VPN network.\n"
+                    L"2. Start the game from longshot.exe and open Online on the title screen.\n"
+                    L"3. The host picks Host Game, then Continue, New Game or Choose a File: the game starts at once.\n"
+                    L"4. Friends pick Join Game and the host's server: they go straight into the host's world.\n\n"
+                    L"Your own saves are never lost: while you play in a friend's world they are kept aside and put back\n"
+                    L"when you leave the session. This is a Beta: please report problems on GitHub.",
                     L"Longshot Co-op Setup", MB_ICONINFORMATION);
 }
 
-static HWND label(HWND parent, const wchar_t* text, int x, int y, int w, int h, HFONT font, int rtl) {
-    HWND c = CreateWindowExW(rtl ? WS_EX_RTLREADING | WS_EX_RIGHT : 0, L"STATIC", text, WS_CHILD | WS_VISIBLE | (rtl ? SS_RIGHT : SS_LEFT),
-                             S(x), S(y), S(w), S(h), parent, NULL, NULL, NULL);
+static HWND label(HWND parent, const wchar_t* text, int x, int y, int w, int h, HFONT font, int id) {
+    HWND c = CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX, S(x), S(y), S(w), S(h), parent,
+                             (HMENU)(INT_PTR)id, NULL, NULL);
     SendMessageW(c, WM_SETFONT, (WPARAM)font, TRUE);
     return c;
 }
@@ -530,36 +659,83 @@ static HWND button(HWND parent, const wchar_t* text, int id, int x, int y, int w
     return c;
 }
 
-enum { ID_LIST = 100, ID_BROWSE, ID_INSTALL, ID_UNINSTALL, ID_REMOVE_SETTINGS, ID_CLOSE, ID_GITHUB, ID_PAYPAL };
+enum {
+    ID_LIST = 100, ID_BROWSE, ID_INSTALL, ID_UNINSTALL, ID_REMOVE_SETTINGS, ID_CLOSE, ID_GITHUB, ID_PAYPAL, ID_PROFILE,
+    ID_BAND_TITLE = 200, ID_BAND_SUB, ID_BAND_BY, ID_HEAD, ID_GUIDE, ID_FOOT
+};
+
+static const wchar_t* const kGuide =
+    L"HOW TO PLAY\r\n"
+    L"1. Every player installs the mod (this Setup) into their own Longshot game folder.\r\n"
+    L"2. Every player installs Radmin VPN and joins the same network (one player creates it, the others join it).\r\n"
+    L"3. Start the game from longshot.exe. The title screen now has an Online entry.\r\n"
+    L"\r\n"
+    L"HOSTING\r\n"
+    L"Online > Host Game, then:\r\n"
+    L"   Continue - your newest save.   New Game - a fresh adventure.   Choose a File - any save of yours.\r\n"
+    L"The game starts at once and friends can join while you play. Your save is the shared world.\r\n"
+    L"\r\n"
+    L"JOINING\r\n"
+    L"Online > Join Game, then pick the host's server (or Join by Address with the host's Radmin VPN address).\r\n"
+    L"You do not choose a file: you go straight into the host's world. Your own items, rupees and bags are kept by the\r\n"
+    L"host for you and come back every time you join. Your own saves are set aside while you play and put back when\r\n"
+    L"you leave (even after a crash, at the next start).\r\n"
+    L"\r\n"
+    L"IN THE GAME\r\n"
+    L"- L3 + R3 (or F2): the online panel - players, Give To (items and rupees), Online Settings.\r\n"
+    L"- Enemies are shared: hits, reactions, kills and their loot happen in every player's world.\r\n"
+    L"- The world is shared: grass, pots and switches live; doors, webs and blocks as they are opened or broken.\r\n"
+    L"- Chests are each player's own: everyone opens their own and gets its item.\r\n"
+    L"- A fallen player waits for a friend to revive them (hold A beside them) or gives up (hold -).\r\n"
+    L"- The pause menu does not stop the world while you play together.\r\n"
+    L"\r\n"
+    L"CO-OP FRAME GENERATION (Online Settings)\r\n"
+    L"Note: made for NVIDIA cards (RTX 20 and 30 series too, where DLSS Frame Generation is not available).\r\n"
+    L"The renderer's own frame generation at 2x, evenly paced on a present thread of its own, with one frame queued for\r\n"
+    L"the least input delay. It can only be turned on while the game's own Frame generation option is Off, and it\r\n"
+    L"starts the next time the game starts.\r\n"
+    L"\r\n"
+    L"UNINSTALL\r\n"
+    L"Run this Setup again and click Uninstall. Only the mod's files are removed; the game's files are never changed.\r\n"
+    L"Saves set aside during an online session are put back first.\r\n"
+    L"\r\n"
+    L"CREDITS\r\n"
+    L"Longshot Co-op is created, designed and maintained by Osama-Alzahrani-UQU.\r\n"
+    L"Copyright (C) 2026 Osama-Alzahrani-UQU. All rights reserved.\r\n"
+    L"Source and releases: " REPO_URL L"\r\n"
+    L"This is an unofficial fan project. It is not affiliated with or endorsed by Nintendo. You need your own copy of the\r\n"
+    L"game; no game files are included.\r\n";
 
 static void build_ui(HWND w) {
     make_fonts();
-    label(w, L"Longshot Co-op (Zelda Multiplayer Mod)", 20, 12, 600, 30, g_font_title, 0);
-    
-    label(w, L"Developer: Osama-Alzahrani-UQU  |  GitHub: https://github.com/Osama-Alzahrani-UQU", 20, 44, 600, 20, g_font_bold, 0);
+    // (the band: drawn in WM_PAINT; its texts on it)
+    label(w, L"Longshot Co-op", 24, 14, 420, 40, g_font_title, ID_BAND_TITLE);
+    label(w, L"Online co-op for 2 to 4 players  -  Version " APP_VERSION, 26, 56, 520, 22, g_font_sub, ID_BAND_SUB);
+    label(w, L"Created by " AUTHOR, 26, 80, 520, 22, g_font_bold, ID_BAND_BY);
 
-    label(w, L"Notice: Works EXCLUSIVELY on Longshot Launcher (longshot.exe). Standalone emulators are unsupported.", 20, 68, 600, 20, g_font, 0);
-    label(w, L"Mandatory: All players MUST join the SAME Radmin VPN network room with synced save locations.", 20, 90, 600, 20, g_font, 0);
-
+    label(w, L"1.  Choose your game folder (the one with longshot.exe)", 24, 124, 600, 22, g_font_bold, ID_HEAD);
     g_list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
-                             S(20), S(114), S(600), S(110), w, (HMENU)ID_LIST, NULL, NULL);
+                             S(24), S(150), S(672), S(84), w, (HMENU)ID_LIST, NULL, NULL);
     SendMessageW(g_list, WM_SETFONT, (WPARAM)g_font, TRUE);
 
-    button(w, L"Browse...", ID_BROWSE, 20, 232, 115, 32, BS_PUSHBUTTON);
-    button(w, L"GitHub: Osama-Alzahrani-UQU", ID_GITHUB, 142, 232, 190, 32, BS_PUSHBUTTON);
-    g_install_btn = button(w, L"Install", ID_INSTALL, 340, 232, 134, 32, BS_DEFPUSHBUTTON);
-    g_uninstall_btn = button(w, L"Uninstall", ID_UNINSTALL, 482, 232, 138, 32, BS_PUSHBUTTON);
+    button(w, L"Browse...", ID_BROWSE, 24, 242, 120, 32, BS_PUSHBUTTON);
+    g_install_btn = button(w, L"Install", ID_INSTALL, 432, 242, 128, 32, BS_DEFPUSHBUTTON);
+    g_uninstall_btn = button(w, L"Uninstall", ID_UNINSTALL, 568, 242, 128, 32, BS_PUSHBUTTON);
+    g_remove_settings = button(w, L"Uninstall also removes the mod's settings and logs", ID_REMOVE_SETTINGS, 24, 280, 520, 22, BS_AUTOCHECKBOX);
+    g_status = label(w, L"", 24, 306, 672, 22, g_font_bold, 0);
 
-    g_remove_settings = button(w, L"Also remove configuration settings on uninstall",
-                               ID_REMOVE_SETTINGS, 20, 272, 600, 24, BS_AUTOCHECKBOX);
+    label(w, L"2.  Read the guide", 24, 336, 600, 22, g_font_bold, 0);
+    g_guide = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", kGuide,
+                              WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+                              S(24), S(362), S(672), S(214), w, (HMENU)ID_GUIDE, NULL, NULL);
+    SendMessageW(g_guide, WM_SETFONT, (WPARAM)g_font_small, TRUE);
 
-    g_status = label(w, L"", 20, 302, 600, 36, g_font_bold, 0);
-
-    label(w, L"All rights reserved (C) 2026 Osama-Alzahrani-UQU. All players MUST join the same Radmin VPN.", 20, 344, 600, 20, g_font, 0);
-    label(w, L"Beta Build: Known issues under active development. Feedback and bug reports are welcome.", 20, 366, 600, 20, g_font, 0);
-
-    button(w, L"Support / Donate (PayPal)", ID_PAYPAL, 20, 396, 190, 30, BS_PUSHBUTTON);
-    button(w, L"Close", ID_CLOSE, 500, 396, 120, 30, BS_PUSHBUTTON);
+    label(w, L"Copyright (C) 2026 " AUTHOR L". All rights reserved. Unofficial fan project, not affiliated with Nintendo.", 24, 588,
+          672, 20, g_font_small, ID_FOOT);
+    button(w, L"GitHub Page", ID_GITHUB, 24, 614, 120, 30, BS_PUSHBUTTON);
+    button(w, L"Author", ID_PROFILE, 152, 614, 96, 30, BS_PUSHBUTTON);
+    button(w, L"Support (PayPal)", ID_PAYPAL, 256, 614, 140, 30, BS_PUSHBUTTON);
+    button(w, L"Close", ID_CLOSE, 576, 614, 120, 30, BS_PUSHBUTTON);
 
     find_games();
     fill_list();
@@ -574,12 +750,9 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case ID_BROWSE: browse(w); break;
-        case ID_GITHUB:
-            ShellExecuteW(w, L"open", L"https://github.com/Osama-Alzahrani-UQU", NULL, NULL, SW_SHOWNORMAL);
-            break;
-        case ID_PAYPAL:
-            ShellExecuteW(w, L"open", L"https://paypal.me/onlinerp53", NULL, NULL, SW_SHOWNORMAL);
-            break;
+        case ID_GITHUB: ShellExecuteW(w, L"open", REPO_URL, NULL, NULL, SW_SHOWNORMAL); break;
+        case ID_PROFILE: ShellExecuteW(w, L"open", PROFILE_URL, NULL, NULL, SW_SHOWNORMAL); break;
+        case ID_PAYPAL: ShellExecuteW(w, L"open", DONATE_URL, NULL, NULL, SW_SHOWNORMAL); break;
         case ID_INSTALL: act(w, 1); break;
         case ID_UNINSTALL: act(w, 0); break;
         case ID_CLOSE: DestroyWindow(w); break;
@@ -588,6 +761,36 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         }
         return 0;
+    case WM_ERASEBKGND: {
+        // (the window white, the band dark across the top with a thin accent line under it)
+        HDC dc = (HDC)wp;
+        RECT r;
+        GetClientRect(w, &r);
+        FillRect(dc, &r, g_brush_window);
+        RECT band = {0, 0, r.right, S(110)};
+        FillRect(dc, &band, g_brush_band);
+        HBRUSH accent = CreateSolidBrush(kAccent);
+        RECT line = {0, S(110), r.right, S(113)};
+        FillRect(dc, &line, accent);
+        DeleteObject(accent);
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)wp;
+        const int id = GetDlgCtrlID((HWND)lp);
+        SetBkMode(dc, TRANSPARENT);
+        if (id == ID_BAND_TITLE || id == ID_BAND_SUB || id == ID_BAND_BY) {
+            SetTextColor(dc, id == ID_BAND_TITLE ? kBandText : id == ID_BAND_BY ? kAccent : kBandDim);
+            return (LRESULT)g_brush_band;
+        }
+        if (id == ID_GUIDE) {   // (the read-only guide)
+            SetTextColor(dc, kText);
+            SetBkColor(dc, kPanel);
+            return (LRESULT)g_brush_panel;
+        }
+        SetTextColor(dc, id == ID_FOOT ? kDim : kText);
+        return (LRESULT)g_brush_window;
+    }
     case WM_DPICHANGED: {
         // (moved to a screen of another scale: the window rebuilt at the new size)
         g_dpi = HIWORD(wp);
@@ -596,11 +799,9 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         HWND child;
         while ((child = GetWindow(w, GW_CHILD)) != NULL) DestroyWindow(child);
         build_ui(w);
+        InvalidateRect(w, NULL, TRUE);
         return 0;
     }
-    case WM_CTLCOLORSTATIC:
-        SetBkMode((HDC)wp, TRANSPARENT);
-        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -616,17 +817,17 @@ static int run_window(HINSTANCE inst) {
     wc.lpfnWndProc = wnd_proc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
+    wc.hbrBackground = NULL;
     wc.lpszClassName = L"LongshotCoopSetup";
     wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(IDI_APP));
     wc.hIconSm = wc.hIcon;
     RegisterClassExW(&wc);
     const UINT dpi = GetDpiForSystem();
-    RECT r = {0, 0, MulDiv(640, (int)dpi, 96), MulDiv(475, (int)dpi, 96)};
+    RECT r = {0, 0, MulDiv(720, (int)dpi, 96), MulDiv(658, (int)dpi, 96)};
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRectExForDpi(&r, style, FALSE, 0, dpi);
-    HWND w = CreateWindowExW(0, wc.lpszClassName, L"Longshot Co-op Setup - Osama-Alzahrani-UQU", style, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left,
-                             r.bottom - r.top, NULL, NULL, inst, NULL);
+    HWND w = CreateWindowExW(0, wc.lpszClassName, L"Longshot Co-op Setup " APP_VERSION L"  -  by " AUTHOR, style, CW_USEDEFAULT,
+                             CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);
     if (!w) return 1;
     ShowWindow(w, SW_SHOWNORMAL);
     UpdateWindow(w);

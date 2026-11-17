@@ -10,6 +10,7 @@
 
 #include "config.h"
 #include "coop.h"
+#include "coopsave.h"
 #include "dialogs.h"
 #include "fellow.h"
 #include "session.h"
@@ -51,6 +52,9 @@ struct AutoLoad {
 int g_decide = -1;
 bool g_back = false, g_open_online = false;
 int g_picked_row = -1;
+// (a guest: the host's world on its way, then loaded from this game's own Load screen)
+bool g_world_wait = false;
+int64_t g_world_since = 0;
 
 void inject(uint64_t b, int frames) {
     g_inject = b;
@@ -61,6 +65,9 @@ std::vector<std::string> items_for(Page p, const SessionView& v) {
     switch (p) {
     case Page::Online:
         return {"Host Game", "Join Game", "Online Settings", "Back"};
+    case Page::HostStart:
+        if (list_saves().empty()) return {"New Game", "Back"};
+        return {"Continue", "New Game", "Choose a File", "Back"};
     case Page::Join: {
         std::vector<std::string> items;
         for (const auto& s : g_join_servers) {
@@ -77,7 +84,7 @@ std::vector<std::string> items_for(Page p, const SessionView& v) {
         return {"Start Game", v.server_running ? "Stop Server" : "Start Server", "Invite Friends", "Leave Lobby"};
     case Page::GuestLobby: {
         const bool ready = v.me >= 0 && v.players[v.me].ready;
-        return {ready ? "Not Ready" : "Ready", "Change File", "Leave Lobby"};
+        return {ready ? "Not Ready" : "Ready", "Leave Lobby"};
     }
     default:
         return {};
@@ -139,6 +146,53 @@ void start_autoload(int row) {
     log("menus: loading file row %d", row);
 }
 
+// (a new game: the title's own New Game. The game asks first (the autosave is written over): a guest's game answers Start
+// itself, its own saves copied aside before; the host answers the game's question)
+void start_newgame(bool answer) {
+    if (answer && !coopsave_protect()) {
+        Session::get().toast("Your saves could not be copied aside: no new game", 2);
+        Session::get().leave();
+        go(Page::Online, 1);
+        return;
+    }
+    g_page = Page::AutoLoad;
+    g_auto = AutoLoad{};
+    g_auto.step = 20;
+    g_auto.row = answer ? 1 : 0;
+    g_auto.at = now_ns();
+    title::show_page({}, 1);
+    log("menus: starting a new game");
+}
+
+// (a guest told to start: the host's world asked for, loaded once it is here)
+void start_world_wait() {
+    Session::get().request_world();
+    g_world_wait = true;
+    g_world_since = now_ns();
+    g_loading_text = "Getting the host's world...";
+    g_loading_since = now_ns();
+    g_loading_until = now_ns() + 3600000000000LL;
+    g_loading_next = Page::AutoLoad;
+    g_page = Page::Loading;
+    title::show_page({" "}, 0);
+}
+
+std::string file_label(int row);
+
+// (the host: the server up and the game started at once, from the file chosen (-2 a new game); friends join it as it goes)
+void host_go(int file) {
+    HostSettings hs = config().host;
+    hs.join_in_progress = true;
+    g_file = file;
+    g_file_label = file == -2 ? std::string("New Game") : file_label(file);
+    if (!Session::get().host_start(hs, file)) {
+        Session::get().toast("The server could not start (the network port is in use?)", 2);
+        go(Page::Online, 0);
+        return;
+    }
+    Session::get().start_game();
+}
+
 void edit_done(bool ok) {
     TextEdit e = g_edit;
     g_edit.open = false;
@@ -182,7 +236,7 @@ void decide(int index) {
     const SessionView v = Session::get().view();
     switch (g_page) {
     case Page::Online:
-        if (index == 0) start_pick(true, Page::HostLobby);
+        if (index == 0) go(Page::HostStart);
         else if (index == 1) go(Page::Join);
         else if (index == 2) dialogs_open_settings();
         else go(Page::Title);
@@ -203,6 +257,14 @@ void decide(int index) {
         } else if (index == std::max(1, n) + 1) {
             go(Page::Online, 1);
         }
+        break;
+    }
+    case Page::HostStart: {
+        const std::string item = index >= 0 && index < (int)g_page_items.size() ? g_page_items[(size_t)index] : "Back";
+        if (item == "Continue") host_go(0);
+        else if (item == "New Game") host_go(-2);
+        else if (item == "Choose a File") start_pick(true, Page::HostLobby);
+        else go(Page::Online, 0);
         break;
     }
     case Page::HostLobby:
@@ -227,8 +289,6 @@ void decide(int index) {
             const bool ready = v.me >= 0 && v.players[v.me].ready;
             Session::get().set_ready(!ready);
             go(Page::GuestLobby, 0);
-        } else if (index == 1) {
-            start_pick(false, Page::GuestLobby);
         } else {
             Session::get().leave();
             go(Page::Online, 1);
@@ -242,6 +302,7 @@ void decide(int index) {
 void back() {
     switch (g_page) {
     case Page::Online: go(Page::Title); break;
+    case Page::HostStart: go(Page::Online, 0); break;
     case Page::Join: go(Page::Online, 1); break;
     case Page::HostLobby:
     case Page::GuestLobby:
@@ -309,6 +370,7 @@ void menus_input(uint64_t* buttons, int32_t stick[4]) {
             if (title::online_focused() && (pressed & kA)) g_open_online = true, take |= kA;
             break;
         case Page::Online:
+        case Page::HostStart:
         case Page::Join:
         case Page::HostLobby:
         case Page::GuestLobby:
@@ -319,8 +381,10 @@ void menus_input(uint64_t* buttons, int32_t stick[4]) {
         case Page::PickFile:
             if (loadscreen::open() && (pressed & kA)) g_picked_row = loadscreen::focused_row(), take |= kA;
             break;
-        case Page::Loading:
         case Page::AutoLoad:
+            if (g_auto.step == 25) break;   // (the game's own question: the host answers it)
+            [[fallthrough]];
+        case Page::Loading:
         case Page::Name:
         case Page::Settings:
             take |= raw;
@@ -390,22 +454,68 @@ void menus_tick(Ctx* c) {
     // a guest joining: the lobby once the host welcomed it, the file choice first
     if (g_page == Page::Loading && g_loading_next == Page::GuestLobby) {
         if (v.role == Role::Guest && v.phase != Phase::Connecting) {
-            start_pick(false, Page::GuestLobby);
+            go(Page::GuestLobby);
         } else if (v.role == Role::None && now - g_loading_since > 500000000LL) {
             go(Page::Join);
+        }
+    } else if (g_page == Page::Loading && g_world_wait) {
+        // (a guest: the host's world coming; into one of this game's slots once it is all here, then loaded)
+        std::vector<uint8_t> caption, progress;
+        int percent = 0;
+        const int got = Session::get().take_world(&caption, &progress, &percent);
+        if (got == 1) {
+            g_world_wait = false;
+            if (coopsave_install(caption, progress) >= 0) {
+                start_autoload(0);   // (written now: the newest, the Load screen's first row)
+            } else {
+                Session::get().toast("No save folder of your own yet: starting a new game", 0);
+                start_newgame(true);
+            }
+        } else if (got < 0) {
+            g_world_wait = false;
+            start_newgame(true);   // (the host has no save yet: a new game, as the host's)
+        } else if (v.role == Role::None) {
+            g_world_wait = false;
+            go(Page::Online, 1);
+        } else if (now - g_world_since > 120000000000LL) {
+            g_world_wait = false;
+            Session::get().toast("The host's world did not arrive", 2);
+            Session::get().leave();
+            go(Page::Online, 1);
+        } else {
+            char t[96];
+            snprintf(t, sizeof t, percent > 0 ? "Getting the host's world... %d%%" : "Getting the host's world...", percent);
+            g_loading_text = t;
         }
     } else if (g_page == Page::Loading && now >= g_loading_until) {
         go(g_loading_next);
     }
-    // the host started (or the guest was told to): the chosen file loads
+    // the host started (or the guest was told to): the host's file loads (a new game starts); a guest asks for the host's
+    // world, or starts a new game with the host
     GameAction a;
     while (Session::get().pop_action(&a)) {
         if (a.kind == GameAction::StartGame) {
-            if (g_file < 0) g_file = 0;   // (no file chosen: the newest)
-            start_autoload(g_file);
+            if (v.role == Role::Guest) {
+                if (a.n == -2) start_newgame(true);
+                else start_world_wait();
+            } else if (g_file == -2) {
+                start_newgame(false);
+            } else {
+                if (g_file < 0) g_file = 0;   // (no file chosen: the newest)
+                start_autoload(g_file);
+            }
         } else {
             game_queue_action(a);   // (items, kills, the trip to the host: the game's side, in play)
         }
+    }
+    // the host's world for guests that ask while the host's game is starting
+    if (v.role == Role::Host) coopsave_host_tick(false);
+    // a guest's own saves, aside while it played in the host's world: back once it is out of the session, at the title
+    static int64_t next_restore = 0;
+    if (v.role == Role::None && now >= next_restore && g_page != Page::AutoLoad && !g_world_wait) {
+        next_restore = now + 2000000000LL;
+        if (coopsave_backup_waiting() && coopsave_restore("back at the title"))
+            Session::get().toast("Your own saves are back", 1);
     }
     // the file choice: the game's Load screen opened for it, the row taken when the player picks one
     if (g_page == Page::PickFile) {
@@ -429,13 +539,13 @@ void menus_tick(Ctx* c) {
             } else if (!loadscreen::open() && title::active()) {
                 // (the player backed out of the Load screen)
                 if (g_after_pick == Page::GuestLobby) Session::get().leave();
-                go(Page::Online, g_pick_host ? 0 : 1);
+                if (g_pick_host) go(Page::HostStart, 2);
+                else go(Page::Online, 1);
             }
         } else if (g_auto.step == 103) {
             if (!loadscreen::open() && title::active()) {
                 if (g_pick_host) {
-                    const bool ok = Session::get().host_start(config().host, g_file);
-                    loading(ok ? "Starting the server..." : "The server could not start", ok ? Page::HostLobby : Page::Online, 1400);
+                    host_go(g_file);
                 } else {
                     go(Page::GuestLobby);
                 }
@@ -455,7 +565,7 @@ void menus_tick(Ctx* c) {
             }
             break;
         case 2:
-            if (title::focused() == 0 && now - g_auto.at > 200000000LL) {
+            if (title::focused() == 0 && now - g_auto.at > 60000000LL) {
                 inject(kA, 3);
                 g_auto.step = 3, g_auto.at = now;
             } else if (now - g_auto.at > 1500000000LL) {
@@ -472,7 +582,7 @@ void menus_tick(Ctx* c) {
             }
             break;
         case 4:
-            if (loadscreen::focused_row() == g_auto.row && now - g_auto.at > 250000000LL) {
+            if (loadscreen::focused_row() == g_auto.row && now - g_auto.at > 90000000LL) {
                 inject(kA, 3);
                 g_auto.step = 5, g_auto.at = now;
             } else if (now - g_auto.at > 1000000000LL) {
@@ -483,10 +593,61 @@ void menus_tick(Ctx* c) {
         case 5:
             // (the game asks to confirm: Load / Cancel, Load focused. Its own dialog, over the list: A again until the load
             // starts, a few times at most)
-            if (now - g_auto.at > 1300000000LL && g_auto.tries < 5) {
+            if (now - g_auto.at > (g_auto.tries ? 1000000000LL : 600000000LL) && g_auto.tries < 5) {
                 g_auto.tries++;
                 inject(kA, 3);
                 g_auto.at = now;
+            }
+            break;
+        case 20:   // (a new game: the title's New Game focused, then pressed)
+            if (title::native()) {
+                title::focus(1);
+                g_auto.step = 21, g_auto.at = now;
+            }
+            break;
+        case 21:
+            if (title::focused() == 1 && now - g_auto.at > 60000000LL) {
+                inject(kA, 3);
+                g_auto.step = 22, g_auto.at = now, g_auto.tries = 0;
+            } else if (now - g_auto.at > 1500000000LL) {
+                title::focus(1);
+                g_auto.at = now;
+            }
+            break;
+        case 22:
+            // (the game's question over the title ("Previous autosave data will be overwritten", Cancel focused): a guest's
+            // game moves to Start and takes it; the host answers it)
+            if (!title::active()) {
+                g_auto.step = 24, g_auto.at = now;
+            } else if (!title::menu_ready() && now - g_auto.at > 300000000LL) {
+                if (g_auto.row == 1) inject(kUp, 3), g_auto.step = 23;
+                else g_auto.step = 25;
+                g_auto.at = now;
+            } else if (title::menu_ready() && now - g_auto.at > 1500000000LL) {
+                g_auto.step = g_auto.tries++ < 3 ? 20 : 24;   // (the press missed: again)
+                g_auto.at = now;
+            }
+            break;
+        case 23:
+            if (now - g_auto.at > 200000000LL) inject(kA, 3), g_auto.step = 24, g_auto.at = now;
+            break;
+        case 24:
+            // (the game starting: the title gone, the panel off for its opening; else the answer missed: again)
+            if (!title::active()) {
+                if (now - g_auto.at > 400000000LL) g_page = Page::Title;
+            } else if (now - g_auto.at > 1200000000LL && g_auto.tries++ < 3) {
+                g_auto.step = title::menu_ready() ? 20 : 22, g_auto.at = now;
+            }
+            break;
+        case 25:
+            // (the host's answer: Start, the game starting; Cancel, back at its choice with the server down)
+            if (!title::active()) {
+                if (now - g_auto.at > 400000000LL) g_page = Page::Title;
+            } else if (!title::menu_ready()) {
+                g_auto.at = now;
+            } else if (now - g_auto.at > 1200000000LL) {
+                Session::get().leave();
+                go(Page::HostStart, 1);
             }
             break;
         }
@@ -496,7 +657,9 @@ void menus_tick(Ctx* c) {
 void menus_in_play() {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_in_play_ns = now_ns();
-    if (g_page == Page::AutoLoad || g_page == Page::Loading || g_page == Page::HostLobby || g_page == Page::GuestLobby) {
+    g_world_wait = false;
+    if (g_page == Page::AutoLoad || g_page == Page::Loading || g_page == Page::HostLobby || g_page == Page::GuestLobby ||
+        g_page == Page::HostStart) {
         g_page = Page::Title;
         title::show_page({}, 3);
     }
@@ -543,6 +706,8 @@ MenuView menus_view() {
     v.loading_text = g_loading_text;
     v.loading_since = g_loading_since;
     v.name_editing = g_edit.open;
+    // (the game's own question, the host's to answer; a new game's opening, the title gone: no panel over them)
+    v.hide_loading = g_page == Page::AutoLoad && (g_auto.step == 25 || (g_auto.step >= 22 && !title::active()));
     return v;
 }
 
@@ -587,6 +752,7 @@ void menus_text_key(int vk) {
 
 namespace {
 constexpr int kSaveSlots = 32;   // (slot_00 and on: the game keeps a rolling list of saves, each in its own folder)
+}  // namespace
 
 // the player's save folder: the --user folder when the game was given one, else the game folder's, then save and the account
 std::wstring save_account_dir() {
@@ -607,7 +773,6 @@ std::wstring save_account_dir() {
     FindClose(h);
     return account;
 }
-}  // namespace
 
 int64_t newest_save_time() {
     const std::wstring dir = save_account_dir();

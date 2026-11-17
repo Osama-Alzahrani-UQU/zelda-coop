@@ -19,12 +19,15 @@
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "coop.h"
+#include "fellow.h"
+#include "game.h"
 #include "session.h"
 
 namespace coop {
@@ -108,6 +111,77 @@ std::string object_of(uint64_t key) {
     return it == g_names.end() ? std::string() : it->second;
 }
 }  // namespace
+
+// ---- blows on placed objects (grass, pots, webs, eye switches): live, by placement
+namespace {
+struct Muted {
+    uint64_t ga;
+    int amount;
+    int64_t until;
+};
+std::mutex g_muted_mutex;
+std::vector<Muted> g_muted;   // (blows from another game given here: the life hook sees them; not sent back)
+
+uint64_t placement_of(uint64_t ga) {
+    const uint64_t rec = r64(ga + 0x3d8);
+    return heap(rec) ? r64(rec + 0x88) : 0;
+}
+}  // namespace
+
+void world_object_hit(uint64_t body, uint32_t before, uint32_t after) {
+    Session& ses = Session::get();
+    if (after >= before || !ses.active() || !ses.others_present()) return;
+    const uint64_t ga = game_actor_of(body);
+    if (!ga) return;
+    const std::string name = game_actor_name(ga);
+    if (name.rfind("Obj_", 0) != 0) return;   // (placed objects: not enemies (shared as kills and hits), not the players)
+    const int amount = (int)(before - after);
+    {
+        std::lock_guard<std::mutex> lock(g_muted_mutex);
+        const int64_t now = now_ns();
+        g_muted.erase(std::remove_if(g_muted.begin(), g_muted.end(), [&](const Muted& m) { return now > m.until; }), g_muted.end());
+        for (auto it = g_muted.begin(); it != g_muted.end(); ++it)
+            if (it->ga == ga && it->amount == amount) {
+                g_muted.erase(it);
+                return;
+            }
+    }
+    const uint64_t placement = placement_of(ga);
+    const LocalSnapshot snap = local_snapshot();
+    if (!placement || !snap.valid || !snap.map[0]) return;
+    ses.send_object_hit(snap.map, name, placement, amount);
+    log("world: %s struck here (-%d): sent (%016llx)", name.c_str(), amount, (unsigned long long)placement);
+}
+
+void world_take_object_hit(Ctx* c, const std::string& map, const std::string& name, uint64_t placement, int amount) {
+    const LocalSnapshot snap = local_snapshot();
+    if (!snap.valid || map != snap.map || amount <= 0 || !snap.mover) return;
+    uint64_t ga = snap.mover;
+    bool found = false;
+    for (int steps = 0; steps < 8192 && !found; steps++) {
+        const uint64_t next = r64(ga + 0x190);
+        if (!heap(next)) return;
+        ga = next - 0x190;
+        if (ga == snap.mover || r64(ga) != kGameActorVt) return;
+        found = placement_of(ga) == placement && game_actor_name(ga) == name;
+    }
+    if (!found) {
+        log("world: %s struck in another game: not in this world now", name.c_str());
+        return;
+    }
+    // (its life: the body's (component 87) *(+0x1c10) + 8)
+    const uint64_t comps = r64(ga + 0x270);
+    const uint64_t body = heap(comps) && (int)r32(ga + 0x278) > 87 ? r64(comps + 8 * 87) : 0;
+    const uint64_t life = heap(body) ? r64(body + 0x1c10) : 0;
+    const int left = heap(life) ? (int)r32(life + 8) : 0;
+    if (left <= 0) return;   // (already cut or broken here)
+    {
+        std::lock_guard<std::mutex> lock(g_muted_mutex);
+        g_muted.push_back({ga, std::min(amount, left), now_ns() + 3000000000LL});
+    }
+    const bool blow = fellow_life_message(c, ga, -amount);
+    log("world: %s struck in another game: struck here too%s", name.c_str(), blow ? "" : " (not taken)");
+}
 
 void world_update(Ctx*, uint64_t mover, const char* map, bool loading, int64_t now) {
     Session& ses = Session::get();
