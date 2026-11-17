@@ -127,6 +127,7 @@ struct EnemySnap {
     std::vector<uint8_t> pose;
     int64_t got_ms = 0;
     uint64_t placement = 0;   // (where the map placed it: the same in every game; 0 one made in play)
+    std::string anim;         // (the AS its game plays on it now: its attack, its reaction, its fall)
 };
 
 // A placed object's state shared between games (world.cpp): GameData's object flag (its 64-bit key: the object's

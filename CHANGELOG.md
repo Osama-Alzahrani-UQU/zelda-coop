@@ -2,6 +2,20 @@
 
 All versions of Longshot Co-op by [Osama-Alzahrani-UQU](https://github.com/Osama-Alzahrani-UQU).
 
+## 1.1.2 Beta (2026-11-18)
+
+### Enemies
+- **Enemy attacks are seen by everyone**: the animation an enemy plays in the game running it (its attack, its jump, its
+  reaction to a hit, its fall, getting up) is played on the same enemy in the other players' games, with the effects and
+  sounds the game ties to those animations. Before, the other games showed the enemy's moves but left it in its own state
+  there (an Octorok attacking your friend stayed asleep under the water in your game).
+- Kills made in another player's game now reach yours within a tenth of a second.
+- Both players need this version: a host refuses a friend with another one.
+
+### Known limits
+- Shots fired by enemies (Octorok rocks, Deku Scrub nuts) are still seen only in the game of the player they are fired
+  at; the enemy's shooting animation is seen by everyone.
+
 ## 1.1.1 Beta (2026-11-17)
 
 ### Fixes

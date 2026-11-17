@@ -536,7 +536,7 @@ static int do_uninstall(const wchar_t* folder, int remove_settings, wchar_t* why
 
 // ---------------------------------------------------------------- the window
 
-#define APP_VERSION L"1.1.1 Beta"
+#define APP_VERSION L"1.1.2 Beta"
 #define AUTHOR L"Osama-Alzahrani-UQU"
 #define REPO_URL L"https://github.com/Osama-Alzahrani-UQU/zelda-coop"
 #define PROFILE_URL L"https://github.com/Osama-Alzahrani-UQU"

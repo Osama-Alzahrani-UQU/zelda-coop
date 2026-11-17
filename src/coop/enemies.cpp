@@ -156,6 +156,9 @@ struct Shown {
     float rot[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
     int64_t got = 0, sent_ms = 0;
     bool init = false;
+    std::string anim;           // (the AS its game plays on it, last told)
+    int64_t anim_at = 0;
+    bool anim_again = false;    // (played once more if this game's own of it took another one over)
 };
 std::vector<Shown> g_shown;
 std::vector<uint64_t> g_led;   // (the enemies this game led last round)
@@ -333,6 +336,17 @@ void enemies_update(Ctx* c, uint64_t mover, const char* map, bool loading, int64
                 it->got = now;
                 const uint64_t ga = shown_actor(*it);
                 if (ga && !e.pose.empty()) pose_show_actor(ga, e.pose, now);
+                // (the AS its game plays on it played on this game's own of it: its attack, its reaction, its fall, with the
+                // effects and sounds the game ties to them; else this game's own plays what it does here (asleep, say))
+                if (ga && !e.anim.empty()) {
+                    if (e.anim != it->anim) {
+                        it->anim = e.anim, it->anim_at = now, it->anim_again = true;
+                        if (game_actor_anim(ga) != e.anim) game_play_as(c, ga, e.anim.c_str(), 1.0f, false);
+                    } else if (it->anim_again && now - it->anim_at > 300000000LL) {
+                        it->anim_again = false;
+                        if (game_actor_anim(ga) != e.anim) game_play_as(c, ga, e.anim.c_str(), 1.0f, false);
+                    }
+                }
             }
         }
         g_shown.erase(std::remove_if(g_shown.begin(), g_shown.end(), [&](const Shown& s) { return now - s.got > kStaleNs; }), g_shown.end());
@@ -383,6 +397,7 @@ void enemies_update(Ctx* c, uint64_t mover, const char* map, bool loading, int64
             e.id = id_of(p.h->ga);
             e.lead = p.lead;
             e.placement = p.h->placement;
+            e.anim = game_actor_anim(p.h->ga);
             memcpy(e.home, p.h->home, sizeof e.home);
             memcpy(e.pos, p.h->pos, sizeof e.pos);
             for (int i = 0; i < 9; i++) e.rot[i] = rf(p.h->ga + 0x328 + 4 * (uint64_t)i);

@@ -167,18 +167,7 @@ bool door_anim(const std::string& a) {
 }
 // (an actor's animation playing now: its AS component (components +0x40) -> +0x18 -> +0x18, the first slot's node, its
 // name at +0x10)
-std::string anim_of(uint64_t ga) {
-    const uint64_t comps = r64(ga + 0x270);
-    if (!heap(comps)) return {};
-    const uint64_t as = r64(comps + 0x40);
-    const uint64_t a = heap(as) ? r64(as + 0x18) : 0;
-    const uint64_t ctl = heap(a) ? r64(a + 0x18) : 0;
-    if (!heap(ctl) || (r32(ctl + 0x18) & 0xffff) == 0) return {};
-    const uint64_t slots = r64(ctl + 0x20);
-    const uint64_t node = heap(slots) ? r64(slots) : 0;
-    const uint64_t s = heap(node) ? r64(node + 0x10) : 0;
-    return s >= 0x80000000ULL ? cstr_at(s, 48) : std::string();
-}
+std::string anim_of(uint64_t ga) { return game_actor_anim(ga); }
 struct Door {
     std::string anim;
     int64_t quiet_until = 0;   // (an animation played here for another player: its change not sent back)

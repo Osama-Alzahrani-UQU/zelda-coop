@@ -28,7 +28,7 @@ enum Msg : uint8_t {
     M_BEACON = 100, M_PRESENCE, M_INVITE
 };
 constexpr int kHeader = 20;
-constexpr char kModVersion[] = "1.1.1";
+constexpr char kModVersion[] = "1.1.2";
 constexpr int64_t kTimeoutMs = 7000;
 
 struct Pending {
@@ -671,6 +671,11 @@ struct Session::Impl {
             e.pose.resize(n);
             r.raw(e.pose.data(), n);
             if (r.left() >= 8) e.placement = r.u64();
+            if (r.left() >= 2) {   // (an AS name: letters, digits and _ only, as the game's are)
+                e.anim = r.str();
+                if (e.anim.size() > 47 || std::any_of(e.anim.begin(), e.anim.end(), [](char ch) { return !(isalnum((unsigned char)ch) || ch == '_'); }))
+                    e.anim.clear();
+            }
             e.got_ms = net::now_ms();
             bool put = false;
             for (auto& o : enemy_in) {
@@ -1427,6 +1432,7 @@ void Session::send_enemy(const EnemySnap& e) {
     w.u16((uint16_t)e.pose.size());
     w.raw(e.pose.data(), e.pose.size());
     w.u64(e.placement);
+    w.str(e.anim);
     d->to_all(w.buf, false);
 }
 std::vector<EnemySnap> Session::enemies() {

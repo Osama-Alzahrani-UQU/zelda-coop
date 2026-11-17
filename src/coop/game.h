@@ -65,6 +65,9 @@ int item_change(Ctx* c, const char* name, int delta);   // (a pouch content adde
 // An AS (animation sequence) played on an actor by its name (Link's: AS/Player_Child.root.asb); keep: nothing done when it
 // is already the one playing. On a game thread with its context.
 bool game_play_as(Ctx* c, uint64_t actor, const char* name, float rate, bool keep);
+// the AS an actor plays now (its AS controller's first slot: components +0x40 -> +0x18 -> +0x18, slots at +0x20, a node's name
+// at +0x10); empty when it has none
+std::string game_actor_anim(uint64_t actor);
 void game_force_as(const std::string& name, int frames);   // (developer test: played on Link each frame for a while)
 int pouch_change(Ctx* c, const char* name, int delta);
 

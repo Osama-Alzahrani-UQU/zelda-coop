@@ -282,7 +282,7 @@ void fellow_update(Ctx* c, uint64_t player, uint64_t mover, const char* map, boo
     if (g_forget_kills.exchange(false)) pending.clear();   // (a player joined: the defeated enemies come back for everyone)
     static int64_t next_kills = 0;
     if (now >= next_kills) {
-        next_kills = now + 250000000LL;
+        next_kills = now + 100000000LL;   // (the others' kills: here within a tenth of a second)
         if (ses.take_respawn()) pending.clear();
         for (auto& k : ses.take_kills()) pending.push_back({std::move(k), 0});
         if (pending.size() > 2048) pending.erase(pending.begin(), pending.begin() + 512);

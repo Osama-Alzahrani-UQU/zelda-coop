@@ -1,7 +1,7 @@
 # Zelda Co-op (Longshot Co-op): Online Multiplayer Mod
 
 **Created, designed and maintained by:** [Osama-Alzahrani-UQU](https://github.com/Osama-Alzahrani-UQU)  
-**Version:** 1.1.1 (Public Beta)  
+**Version:** 1.1.2 (Public Beta)  
 **Repository:** [github.com/Osama-Alzahrani-UQU/zelda-coop](https://github.com/Osama-Alzahrani-UQU/zelda-coop)  
 **Support & Donations:** [paypal.me/onlinerp53](https://paypal.me/onlinerp53)
 
@@ -72,6 +72,9 @@ Watch the co-op gameplay montage on TikTok:
 ### Shared enemies
 - An enemy near several players is run by the game of the nearest player and copied, pose by pose, in the others'
   games: its moves, attacks and reactions are the same for everyone.
+- **Every player sees the enemy's attacks**: the animation it plays in the game running it (attacks, jumps, reactions,
+  falls) is played on it in every game, with the game's own effects and sounds for those animations. (Shots an enemy
+  fires, such as an Octorok's rock, are still seen only by the player they are fired at.)
 - **Hits are shared as real blows**: a hit in one game is given to the same enemy in the others through the game's own
   damage, so it flinches and reacts there too.
 - **Kills are shared as real deaths**: the enemy plays its own death in every game and **drops its own loot** for each
