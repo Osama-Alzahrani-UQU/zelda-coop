@@ -31,7 +31,7 @@ An online multiplayer cooperative mod for the Longshot PC game engine. Allows 2 
 
 ### Video Showcase (TikTok)
 Watch the official co-op gameplay montage on TikTok:  
-🎬 **[Watch Gameplay on TikTok](https://www.tiktok.com/@Osama-Alzahrani-UQU)**
+🎬 **[Watch Gameplay on TikTok](https://vt.tiktok.com/ZSpGeU23w/)**
 
 ### In-Game Screenshots
 
