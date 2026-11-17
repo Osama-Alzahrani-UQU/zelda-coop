@@ -24,11 +24,11 @@ enum Kind : uint8_t { kReliable = 0, kUnreliable = 1, kAckOnly = 2, kDiscovery =
 enum Msg : uint8_t {
     M_HELLO = 1, M_WELCOME, M_REJECT, M_LOBBY, M_READY, M_START, M_STATE, M_PING, M_PONG, M_BYE, M_TOAST,
     M_GIFT_OFFER, M_GIFT_REPLY, M_GIFT_SEND, M_GIFT_DONE, M_KILL, M_KICK, M_SAVE_ALL, M_REVIVE, M_RESPAWN, M_POSE, M_STARTER, M_GEAR, M_ENEMY, M_EHIT, M_WFLAG,
-    M_WORLD_ASK, M_WORLD_PIECE, M_ITEMS_KEEP, M_ITEMS_BACK, M_OBJHIT,
+    M_WORLD_ASK, M_WORLD_PIECE, M_ITEMS_KEEP, M_ITEMS_BACK, M_OBJHIT, M_FX, M_PROJ, M_DOOR, M_STICKFIRE,
     M_BEACON = 100, M_PRESENCE, M_INVITE
 };
 constexpr int kHeader = 20;
-constexpr char kModVersion[] = "1.1.0";
+constexpr char kModVersion[] = "1.1.1";
 constexpr int64_t kTimeoutMs = 7000;
 
 struct Pending {
@@ -108,6 +108,10 @@ struct Session::Impl {
     } world;
     std::vector<std::pair<std::string, std::string>> items_kept;   // (the host: guests' items to keep, by name)
     std::string items_back;                                        // (a guest: its own items, from the host)
+    std::vector<GameAction> effects_in;                            // (the others' blasts, not taken yet)
+    std::vector<ProjectileSnap> proj_in;                           // (the others' projectiles, not taken yet)
+    std::vector<GameAction> doors_in;                              // (the others' doors opening, not taken yet)
+    std::vector<std::pair<int, int>> stick_in;                     // (the others' sticks lit: slot, seconds)
     bool items_back_new = false;
     std::vector<KillEvent> new_kills;   // (the others' kills, for this game to carry out)
     std::atomic<int> n_new_kills{0};
@@ -374,6 +378,10 @@ struct Session::Impl {
         world_asks.clear();
         world_out.clear();
         world = WorldIn{};
+        effects_in.clear();
+        proj_in.clear();
+        doors_in.clear();
+        stick_in.clear();
         items_kept.clear();
         items_back_new = false;
         n_new_kills = 0;
@@ -662,6 +670,7 @@ struct Session::Impl {
             if (role == Role::Host && e.owner != c.slot) return;
             e.pose.resize(n);
             r.raw(e.pose.data(), n);
+            if (r.left() >= 8) e.placement = r.u64();
             e.got_ms = net::now_ms();
             bool put = false;
             for (auto& o : enemy_in) {
@@ -671,11 +680,11 @@ struct Session::Impl {
                     break;
                 }
             }
-            if (!put) {
+            if (!put) {   // (room for every player's shared enemies: a full list would leave some enemies uncopied)
                 enemy_in.erase(std::remove_if(enemy_in.begin(), enemy_in.end(),
-                                              [&](const EnemySnap& o) { return e.got_ms - o.got_ms > 3000; }),
+                                              [&](const EnemySnap& o) { return e.got_ms - o.got_ms > 1000; }),
                                enemy_in.end());
-                if (enemy_in.size() < 64) enemy_in.push_back(e);
+                if (enemy_in.size() < 256) enemy_in.push_back(e);
             }
             if (role == Role::Host) to_all(std::vector<uint8_t>(msg, msg + len), false, e.owner);
             break;
@@ -743,6 +752,54 @@ struct Session::Impl {
             if (!r.ok()) return;
             items_back = list, items_back_new = true;
             log("session: the host gave back this player's items (%zu bytes)", list.size());
+            break;
+        }
+        case M_STICKFIRE: {   // (another player's Deku Stick lit, or out)
+            const int from = r.u8();
+            const int seconds = r.u8();
+            if (!r.ok() || from >= kMaxPlayers) return;
+            if (role == Role::Host && from != c.slot) return;
+            if (from != me && stick_in.size() < 16) stick_in.push_back({from, seconds});
+            if (role == Role::Host) to_all(std::vector<uint8_t>(msg, msg + len), true, from);
+            break;
+        }
+        case M_DOOR: {   // (a door opening or closing in another game)
+            const int from = r.u8();
+            GameAction a{GameAction::ObjectHit};
+            const std::string mp = r.str(), anim = r.str();
+            a.key = r.u64();
+            if (!r.ok() || from >= kMaxPlayers || anim.size() > 64 || !a.key) return;
+            if (role == Role::Host && from != c.slot) return;
+            a.s = mp + '\n' + anim;
+            if (from != me && doors_in.size() < 64) doors_in.push_back(a);
+            if (role == Role::Host) to_all(std::vector<uint8_t>(msg, msg + len), true, from);
+            break;
+        }
+        case M_PROJ: {   // (a projectile of another player's: where it is, or its end)
+            ProjectileSnap p;
+            p.owner = r.u8();
+            p.map = r.str();
+            p.id = r.u32();
+            p.kind = r.u8();
+            p.end = r.u8() != 0;
+            for (float& v : p.pos) v = r.f32();
+            if (!r.ok() || p.owner >= kMaxPlayers) return;
+            if (role == Role::Host && p.owner != c.slot) return;
+            p.got_ms = net::now_ms();
+            if (p.owner != me && proj_in.size() < 512) proj_in.push_back(p);
+            if (role == Role::Host) to_all(std::vector<uint8_t>(msg, msg + len), p.end, p.owner);
+            break;
+        }
+        case M_FX: {   // (a blast in another game: made here too)
+            const int from = r.u8();
+            GameAction a{GameAction::ObjectHit};
+            const std::string mp = r.str(), nm = r.str();
+            for (float& v : a.pos) v = r.f32();
+            if (!r.ok() || from >= kMaxPlayers || nm.size() > 64) return;
+            if (role == Role::Host && from != c.slot) return;
+            a.s = mp + '\n' + nm;
+            if (from != me && effects_in.size() < 64) effects_in.push_back(a);
+            if (role == Role::Host) to_all(std::vector<uint8_t>(msg, msg + len), true, from);
             break;
         }
         case M_OBJHIT: {   // (a blow on a placed object in another game: the same object here)
@@ -1369,6 +1426,7 @@ void Session::send_enemy(const EnemySnap& e) {
     for (float v : e.rot) w.f32(v);
     w.u16((uint16_t)e.pose.size());
     w.raw(e.pose.data(), e.pose.size());
+    w.u64(e.placement);
     d->to_all(w.buf, false);
 }
 std::vector<EnemySnap> Session::enemies() {
@@ -1401,6 +1459,75 @@ void Session::send_object_hit(const std::string& map, const std::string& name, u
     w.u64(placement);
     w.u16((uint16_t)std::min(amount, 65535));
     d->to_all(w.buf, true);
+}
+void Session::send_effect(const std::string& map, const std::string& name, const float pos[3]) {
+    std::lock_guard<std::mutex> lock(d->m);
+    if (d->role == Role::None || d->me < 0) return;
+    Writer w;
+    w.u8(M_FX);
+    w.u8((uint8_t)d->me);
+    w.str(map), w.str(name);
+    for (int i = 0; i < 3; i++) w.f32(pos[i]);
+    d->to_all(w.buf, true);
+}
+void Session::send_projectile(const std::string& map, uint32_t id, int kind, bool end, const float pos[3]) {
+    std::lock_guard<std::mutex> lock(d->m);
+    if (d->role == Role::None || d->me < 0) return;
+    Writer w;
+    w.u8(M_PROJ);
+    w.u8((uint8_t)d->me);
+    w.str(map);
+    w.u32(id), w.u8((uint8_t)kind), w.u8(end ? 1 : 0);
+    for (int i = 0; i < 3; i++) w.f32(pos[i]);
+    d->to_all(w.buf, end);
+}
+void Session::send_door(const std::string& map, uint64_t placement, const std::string& anim) {
+    std::lock_guard<std::mutex> lock(d->m);
+    if (d->role == Role::None || d->me < 0 || !placement) return;
+    Writer w;
+    w.u8(M_DOOR);
+    w.u8((uint8_t)d->me);
+    w.str(map), w.str(anim);
+    w.u64(placement);
+    d->to_all(w.buf, true);
+}
+void Session::send_stick_fire(int seconds) {
+    std::lock_guard<std::mutex> lock(d->m);
+    if (d->role == Role::None || d->me < 0) return;
+    Writer w;
+    w.u8(M_STICKFIRE);
+    w.u8((uint8_t)d->me), w.u8((uint8_t)std::clamp(seconds, 0, 255));
+    d->to_all(w.buf, true);
+}
+bool Session::take_stick_fire(int* slot, int* seconds) {
+    std::lock_guard<std::mutex> lock(d->m);
+    if (d->stick_in.empty()) return false;
+    *slot = d->stick_in.front().first, *seconds = d->stick_in.front().second;
+    d->stick_in.erase(d->stick_in.begin());
+    return true;
+}
+std::vector<GameAction> Session::take_doors() {
+    std::lock_guard<std::mutex> lock(d->m);
+    std::vector<GameAction> out;
+    out.swap(d->doors_in);
+    return out;
+}
+std::vector<ProjectileSnap> Session::take_projectiles() {
+    std::lock_guard<std::mutex> lock(d->m);
+    std::vector<ProjectileSnap> out;
+    out.swap(d->proj_in);
+    return out;
+}
+std::vector<GameAction> Session::take_effects() {
+    std::lock_guard<std::mutex> lock(d->m);
+    std::vector<GameAction> out;
+    out.swap(d->effects_in);
+    return out;
+}
+void Session::tell_others(const std::string& text, int kind) {
+    std::lock_guard<std::mutex> lock(d->m);
+    if (d->role == Role::None || d->me < 0) return;
+    d->to_all(d->msg_toast(text, kind), true);
 }
 void Session::push_gear(const std::string& gear) {
     std::lock_guard<std::mutex> lock(d->m);

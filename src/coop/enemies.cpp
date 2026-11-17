@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "coop.h"
+#include "effects.h"
 #include "fellow.h"
 #include "game.h"
 #include "pose.h"
@@ -40,8 +41,7 @@ constexpr uint64_t kGameActorVt = 0x84b45e18ULL, kFnSetTransform = 0x804e6630ULL
 constexpr float kShareRadius = 35.0f;      // (an enemy this near another player is shared with them)
 constexpr float kHandOver = 3.0f;
 constexpr float kHomeMatch = 1.5f;
-constexpr float kStandInReach = 80.0f;     // (stand-ins only for enemies this near this player)
-constexpr int kMaxSent = 8;                // (enemies sent a round: the led ones first, the nearest to the others first)
+constexpr int kMaxSent = 12;               // (led enemies sent a round: the nearest to the others, then the rest in turn)
 constexpr int kMaxStandIns = 12;
 constexpr int64_t kRoundNs = 66000000LL;   // (15 times a second)
 constexpr int64_t kStaleNs = 400000000LL;
@@ -110,7 +110,15 @@ struct Here {
     uint64_t ga = 0;
     std::string name;
     float pos[3] = {0, 0, 0}, home[3] = {0, 0, 0};
+    uint64_t placement = 0;   // (the map's placement: the same enemy in every game; 0 one made in play)
 };
+
+// (an actor's placement by the map: its record *(+0x3d8), the hash at +0x88; 0 for one made in play)
+uint64_t placement_of(uint64_t ga) {
+    const uint64_t rec = r64(ga + 0x3d8);
+    const uint64_t h = heap(rec) ? r64(rec + 0x88) : 0;
+    return h == ~0ULL ? 0 : h;
+}
 
 std::vector<Here> enemies_here(uint64_t mover) {
     std::vector<Here> out;
@@ -130,6 +138,7 @@ std::vector<Here> enemies_here(uint64_t mover) {
         if (h.name.empty() || !game_actor_pos(ga, h.pos)) continue;
         for (int k = 0; k < 3; k++) h.home[k] = rf(ga + 0x2ec + 4 * (uint64_t)k);
         if (!std::isfinite(h.home[0]) || !std::isfinite(h.home[1]) || !std::isfinite(h.home[2])) continue;
+        h.placement = placement_of(ga);
         out.push_back(std::move(h));
     }
     return out;
@@ -159,16 +168,25 @@ uint64_t shown_actor(const Shown& s) {
     return si && stand_in_alive(*si) ? si->ga : 0;
 }
 
-// (this game's own of an enemy another game sends: the same name, its home within 1.5 m, not shown for another already;
-// the nearest to where it is there)
-const Here* counterpart(const std::string& name, const float home[3], const float pos[3]) {
+// (this game's own of an enemy another game sends, not shown for another already: one the map placed, by its placement
+// (exact); one made in play (a larva, a respawned one), the nearest of that name to where it is there, its home or itself
+// within reach)
+const Here* counterpart(const std::string& name, const float home[3], const float pos[3], uint64_t placement = 0) {
+    auto taken = [](const Here& h) {
+        for (const Shown& s : g_shown)
+            if (!s.stand_key && s.ga == h.ga) return true;
+        return false;
+    };
+    if (placement) {
+        for (const Here& h : g_here)
+            if (h.placement == placement && h.name == name && !taken(h)) return &h;
+        return nullptr;   // (a placed enemy this game does not have now: its room not loaded here, or it is down here)
+    }
     const Here* best = nullptr;
     float best_d = 1e9f;
     for (const Here& h : g_here) {
-        if (h.name != name || dist3(h.home, home) > kHomeMatch) continue;
-        bool taken = false;
-        for (const Shown& s : g_shown) taken |= !s.stand_key && s.ga == h.ga;
-        if (taken) continue;
+        if (h.name != name || h.placement || taken(h)) continue;
+        if (dist3(h.home, home) > kHomeMatch && dist3(h.pos, pos) > 6.0f) continue;
         const float d = dist3(h.pos, pos);
         if (d < best_d) best_d = d, best = &h;
     }
@@ -262,25 +280,42 @@ void enemies_update(Ctx* c, uint64_t mover, const char* map, bool loading, int64
         next_round = now + kRoundNs;
         g_here = enemies_here(mover);
         g_here.erase(std::remove_if(g_here.begin(), g_here.end(), [](const Here& h) { return is_stand_in(h.ga); }), g_here.end());
-        // ---- the others' enemies: copied by this game's own, or shown by a stand-in
+        // (a death the life hook did not see (not through the body's damage step): an enemy alive last round, still
+        // here with no life left now: its kill sent as the hook's would be (once: fellow.cpp keeps who it sent))
+        {
+            static std::vector<std::pair<uint64_t, std::string>> alive;
+            for (const auto& [ga, name] : alive) {
+                bool still = false;
+                for (const Here& h : g_here) still |= h.ga == ga;
+                if (still || !heap(ga) || r64(ga) != kGameActorVt || game_actor_name(ga) != name) continue;
+                const uint64_t life = game_actor_life(ga);
+                if (life && (int32_t)r32(life) <= 0 && fellow_enemy_died_actor(ga))
+                    log("enemies: %s died here without the damage step: its kill sent", name.c_str());
+            }
+            alive.clear();
+            for (const Here& h : g_here) alive.push_back({h.ga, h.name});
+        }
+        // ---- the others' enemies: copied by this game's own (a boss never: each game runs its own)
         for (const EnemySnap& e : ses.enemies()) {
             if (e.map != map || e.owner < 0 || e.owner >= kMaxPlayers || e.owner == me || !used[e.owner]) continue;
+            if (e.name.find("Boss") != std::string::npos) continue;
             const bool take_over = dist3(e.pos, mine) < dist3(e.pos, st[e.owner].pos) - kHandOver;
             auto it = std::find_if(g_shown.begin(), g_shown.end(), [&](const Shown& s) { return s.owner == e.owner && s.id == e.id; });
             if (it == g_shown.end()) {
                 Shown s;
                 s.owner = e.owner, s.id = e.id, s.name = e.name;
                 memcpy(s.home, e.home, sizeof s.home);
-                if (const Here* h = counterpart(e.name, e.home, e.pos)) {
-                    if (!e.lead || take_over) continue;   // (this game runs its own)
-                    s.ga = h->ga;
-                    log("enemies: %s copied from player %d's game", e.name.c_str(), e.owner);
-                } else {
-                    if (dist3(e.pos, mine) > kStandInReach) continue;
-                    s.stand_key = stand_in_for(c, e.name, e.pos, e.rot, now);
-                    if (!s.stand_key) continue;
-                    log("enemies: a stand-in for %s of player %d's game (this game has none of it)", e.name.c_str(), e.owner);
-                }
+                // (no stand-ins: every player plays the host's world, so an enemy another game has is in this game too
+                // where this player is; one this game does not have (its room not loaded here, or down here) is not made
+                // here: a made one would be an extra enemy, unseen, still fighting)
+                const Here* h = counterpart(e.name, e.home, e.pos, e.placement);
+                if (!h) continue;
+                if (!e.lead || take_over) continue;   // (this game runs its own)
+                // (both games leading it at once (each the nearer by its own reckoning, a moment's lag apart): the lower
+                // slot keeps it, so the two never copy each other and leave it to nobody)
+                if (me < e.owner && std::find(g_led.begin(), g_led.end(), h->ga) != g_led.end()) continue;
+                s.ga = h->ga;
+                log("enemies: %s copied from player %d's game", e.name.c_str(), e.owner);
                 g_shown.push_back(s);
                 it = g_shown.end() - 1;
             } else if (!it->stand_key && (!e.lead || take_over)) {
@@ -301,13 +336,7 @@ void enemies_update(Ctx* c, uint64_t mover, const char* map, bool loading, int64
             }
         }
         g_shown.erase(std::remove_if(g_shown.begin(), g_shown.end(), [&](const Shown& s) { return now - s.got > kStaleNs; }), g_shown.end());
-        // (a stand-in gives way to this game's own copy once it has one: its room loaded)
-        for (Shown& s : g_shown)
-            if (s.stand_key)
-                if (const Here* h = counterpart(s.name, s.home, s.pos)) {
-                    log("enemies: %s of player %d's game: this game's own copy now in place of its stand-in", s.name.c_str(), s.owner);
-                    s.stand_key = 0, s.ga = h->ga, s.init = false;
-                }
+
         // ---- this game's own enemies near another player, the ones it does not copy: sent, the ones it leads first
         struct Pick {
             bool lead;
@@ -319,29 +348,46 @@ void enemies_update(Ctx* c, uint64_t mover, const char* map, bool loading, int64
             bool copied = false;
             for (const Shown& s : g_shown) copied |= !s.stand_key && s.ga == h.ga;
             if (copied) continue;
+            // (a boss and its parts (Enemy_DungeonBoss_*, Enemy_MiddleBoss_*) run in each game on their own: one put
+            // where another game has it every frame is pushed through its walls as it climbs; its hits and its defeat
+            // are shared all the same)
+            if (h.name.find("Boss") != std::string::npos) continue;
             const float d_other = near_other(h.pos);
             if (d_other > kShareRadius) continue;
             const float d_me = dist3(h.pos, mine);
             const bool led = std::find(g_led.begin(), g_led.end(), h.ga) != g_led.end();
             picks.push_back({d_me < d_other || (led && d_me < d_other + kHandOver), d_other, &h});
         }
-        std::sort(picks.begin(), picks.end(), [](const Pick& a, const Pick& b) {
-            return a.lead != b.lead ? a.lead : a.near_other < b.near_other;
-        });
-        if ((int)picks.size() > kMaxSent) picks.resize(kMaxSent);
+        // (only the ones this game leads go: the others' games copy only led enemies. All of them reach the others: the
+        // nearest to them every round, the rest in turn, so a room full of enemies keeps every one of them in step)
         std::vector<uint64_t> led;
+        for (const Pick& p : picks)
+            if (p.lead) led.push_back(p.h->ga);
+        picks.erase(std::remove_if(picks.begin(), picks.end(), [](const Pick& p) { return !p.lead; }), picks.end());
+        std::sort(picks.begin(), picks.end(), [](const Pick& a, const Pick& b) { return a.near_other < b.near_other; });
+        if ((int)picks.size() > kMaxSent) {
+            static size_t turn = 0;
+            constexpr int kFirst = kMaxSent / 2;   // (the nearest always; the others in turn)
+            std::vector<Pick> sent(picks.begin(), picks.begin() + kFirst);
+            const size_t rest = picks.size() - kFirst;
+            // (each of the rest at least every 4th round (264 ms): within the 400 ms its copies stay fresh)
+            const size_t quota = std::min(rest, std::max((size_t)(kMaxSent - kFirst), (rest + 3) / 4));
+            for (size_t k = 0; k < quota; k++) sent.push_back(picks[kFirst + (turn + k) % rest]);
+            turn += quota;
+            picks.swap(sent);
+        }
         for (const Pick& p : picks) {
             EnemySnap e;
             e.map = map;
             e.name = p.h->name;
             e.id = id_of(p.h->ga);
             e.lead = p.lead;
+            e.placement = p.h->placement;
             memcpy(e.home, p.h->home, sizeof e.home);
             memcpy(e.pos, p.h->pos, sizeof e.pos);
             for (int i = 0; i < 9; i++) e.rot[i] = rf(p.h->ga + 0x328 + 4 * (uint64_t)i);
             if (!pose_capture_actor(p.h->ga, &e.pose)) e.pose.clear();
             ses.send_enemy(e);
-            if (p.lead) led.push_back(p.h->ga);
         }
         if (led.size() != g_led.size()) log("enemies: this game leads %zu shared enemies (%zu sent)", led.size(), picks.size());
         g_led.swap(led);
@@ -388,6 +434,10 @@ void hit_sent(uint64_t ga, int amount) {
     Session& ses = Session::get();
     if (!ses.active() || !ses.others_present() || !ga || amount <= 0) return;
     if (muted_hit(ga, amount)) return;
+    {   // (struck by another player's blast made here: its own game sends that hit)
+        float p[3];
+        if (game_actor_pos(ga, p) && effects_remote_blast_near(p)) return;
+    }
     const std::string name = game_actor_name(ga);
     if (name.rfind("Enemy_", 0) != 0) return;
     const LocalSnapshot snap = local_snapshot();

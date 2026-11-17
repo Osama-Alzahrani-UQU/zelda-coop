@@ -19,6 +19,7 @@ uint64_t game_actor_life(uint64_t ga);               // the address of its life 
 
 // ---- kills (game threads)
 void fellow_enemy_died(uint64_t body);               // (the life hook: an actor's life reached 0 in this game)
+bool fellow_enemy_died_actor(uint64_t ga);           // (the same, by its GameActor: a death seen another way; true: sent)
 // an enemy brought down as by a blow of the game's own (its death, its loot), not sent to the others (a kill of theirs
 // carried out here): false when its body takes no life message
 bool fellow_kill_actor(Ctx* c, uint64_t ga);

@@ -26,7 +26,11 @@ void pose_frame(Ctx* c, int64_t now);
 void pose_mirror(bool on);
 
 // ---- any actor's pose, every bone (the shared enemies: enemies.cpp)
-bool pose_capture_actor(uint64_t actor, std::vector<uint8_t>* blob);   // (its bones as its game animated them)
+bool pose_capture_actor(uint64_t actor, std::vector<uint8_t>* blob);
+// an actor's model's far end where it is drawn now (its bone farthest from its root; else its root and length along its
+// model's +Y): a held Deku Stick's burning end. In the renderer's frame, as pose_actor_root's
+bool pose_actor_tip(uint64_t actor, float length, float out[3]);
+bool pose_actor_root(uint64_t actor, float out[3]);   // (its model's root bone, in the same frame as pose_actor_tip's)   // (its bones as its game animated them)
 // (the pose another game sent for this game's copy of an actor: drawn at the lenses while it keeps coming)
 void pose_show_actor(uint64_t actor, const std::vector<uint8_t>& blob, int64_t now);
 

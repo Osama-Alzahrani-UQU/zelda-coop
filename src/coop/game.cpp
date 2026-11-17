@@ -13,6 +13,7 @@
 #include "coop.h"
 #include "coopsave.h"
 #include "dialogs.h"
+#include "effects.h"
 #include "enemies.h"
 #include "world.h"
 #include "fellow.h"
@@ -733,6 +734,7 @@ void game_actor_damaged(Ctx* c, uint64_t actor, uint32_t before, uint32_t after,
     }
     if (!player && after < before && after != 0) enemies_hit(actor, before, after);   // (the same life taken in the others)
     if (!player && after < before) world_object_hit(actor, before, after);   // (grass cut, a switch struck: in the others')
+    if (!player && after < before) effects_actor_struck(actor, after);       // (a bomb going off: in the others' worlds)
     if (player || after != 0 || before == 0) return;
     fellow_enemy_died(actor);   // (an enemy down here: down in the others' games too)
 }
@@ -934,6 +936,7 @@ void game_player_update(Ctx* c, uint64_t mover) {
         puppets_update(c, map, loading, now);   // (the other players as the game's own Link)
         enemies_update(c, mover, map, loading, now);   // (enemies near other players: run by one game, copied by the others)
         world_update(c, mover, map, loading, now);     // (the placed objects' state: shared with the others' worlds)
+        effects_update(c, mover, map, loading, now);   // (the players' projectiles and effects: in every world)
     }
     // the trip to the host, when the game started (guests) or a guest asked
     if (v.role == Role::Guest && v.phase == Phase::Playing) {

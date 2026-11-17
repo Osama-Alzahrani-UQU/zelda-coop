@@ -1,7 +1,7 @@
 # Zelda Co-op (Longshot Co-op): Online Multiplayer Mod
 
 **Created, designed and maintained by:** [Osama-Alzahrani-UQU](https://github.com/Osama-Alzahrani-UQU)  
-**Version:** 1.1.0 (Public Beta)  
+**Version:** 1.1.1 (Public Beta)  
 **Repository:** [github.com/Osama-Alzahrani-UQU/zelda-coop](https://github.com/Osama-Alzahrani-UQU/zelda-coop)  
 **Support & Donations:** [paypal.me/onlinerp53](https://paypal.me/onlinerp53)
 
@@ -76,14 +76,34 @@ Watch the co-op gameplay montage on TikTok:
   damage, so it flinches and reacts there too.
 - **Kills are shared as real deaths**: the enemy plays its own death in every game and **drops its own loot** for each
   player (Deku Nuts, rupees, hearts...).
-- Enemies a game has never made (a room another player is in) are shown with stand-ins.
+- **Every kind of enemy is shared**, including the ones the game keeps their life in another way (Bari and Biri
+  jellyfish, Shabom bubbles, Tektites, Wallmasters, the Lost Woods stage Scrubs), and enemies made during play (the
+  Biri a Bari splits into, respawning bubbles) are paired too.
+- **Every enemy near another player stays in step**, however full the room: the nearest every moment, the rest in turn,
+  each one refreshed several times a second.
+- The same enemy is recognised in every game by where the map placed it, so each one is paired exactly; no extra
+  enemies are ever made (an enemy in a room another player has loaded and you have not is simply not there for you).
+- When two games would both run the same enemy at once, one of them always gives way, so an enemy is never left to
+  nobody or flickering between players.
+- **Bosses** run in each game on their own (so they never get pushed into walls); their hits and their defeat are
+  shared.
+- **The other players' shots are drawn where they fly**: slingshot seeds, Deku Nuts, arrows and the hookshot's chain,
+  with their end as their own burst (a Deku Nut's white flash, a seed's or an arrow's spark). What they hit is shared.
 
 ### Shared world
 - **Live**: cutting grass, breaking pots, striking eye switches and burning webs happen in every game at once, each
   with its own effect and drop (the rupee in the grass is there for everyone).
 - **Lasting state**: doors unlocked, switches pressed, webs broken, blocks and platforms moved are shared through the
-  game's own object flags (an object a player is looking at changes once its room is entered again).
-- **Chests are each player's own**: everyone opens their own chest and gets its item.
+  game's own object flags.
+- **Doors open in front of you**: a door another player opens or closes near them swings open and shut in your world
+  with its own animation.
+- **Gone at once**: a web, a rock, a cracked wall or a lock another player breaks or opens disappears in your world right
+  away, even while you look at it. Other objects (ladders, platforms) take their new state when their room is entered
+  again.
+- **Bombs go off in every world**: a player's bomb explodes at the same spot in the others' games with its real blast
+  (cracked walls, rocks, enemies, anyone too close); its hits are counted once.
+- **Chests are each player's own**: everyone opens their own chest and gets its item. When a friend opens a chest in the
+  room you are in, you are told that yours still holds its item for you.
 
 ### Playing together
 - The other players appear as Link with their real pose, sword, shield and items in hand, nameplates and hearts.

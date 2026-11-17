@@ -26,8 +26,10 @@
 #include <vector>
 
 #include "coop.h"
+#include "effects.h"
 #include "fellow.h"
 #include "game.h"
+#include "runtime.h"
 #include "session.h"
 
 namespace coop {
@@ -86,9 +88,12 @@ long find_key(uint64_t key) {
     return -1;
 }
 
+std::unordered_map<uint64_t, uint64_t> g_actor_of;   // (placement hash -> its actor here now)
+
 // (the placement hashes of the objects in this world now; their names kept for the map)
 std::unordered_set<uint64_t> objects_here(uint64_t mover) {
     std::unordered_set<uint64_t> out;
+    g_actor_of.clear();
     uint64_t ga = mover;
     for (int steps = 0; steps < 8192; steps++) {
         const uint64_t next = r64(ga + 0x190);
@@ -99,9 +104,62 @@ std::unordered_set<uint64_t> objects_here(uint64_t mover) {
         if (!heap(rec)) continue;
         const uint64_t hash = r64(rec + 0x88);
         out.insert(hash);
+        g_actor_of[hash] = ga;
         if (!g_names.count(hash) && g_names.size() < 20000) g_names[hash] = cstr_at(r64(ga + 0x260), 64);
     }
     return out;
+}
+
+// An object whose changed state means it is gone (a web broken, a rock or a cracked wall blown up, a lock opened, a floor
+// fallen): taken away at once when another player's game says so, while this player looks at it. Others (a ladder that
+// falls into place, a door, a platform, a switch) keep their state for when they are made again.
+bool goes_away(const std::string& name) {
+    static const char* const kGone[] = {"SpiderWeb_", "Breakable", "BrokenBomb", "Crack", "Rock", "Boulder", "Barricade",
+                                        "Lock", "FallingFloor", "FallFloor", "Bombable"};
+    if (name.find("Ladder") != std::string::npos || name.find("Prop") != std::string::npos) return false;
+    for (const char* w : kGone)
+        if (name.find(w) != std::string::npos) return true;
+    return false;
+}
+
+// (an object taken away here as its own break does: a blow when it has a life (its break, its effect), else the scripts'
+// OneShotGenericDeleteThisActor (f_800c6490(actor, 0)); its parts (the actors of its kind at its place) with it)
+void take_away(Ctx* c, uint64_t mover, uint64_t ga, const std::string& name) {
+    float at[3];
+    if (!game_actor_pos(ga, at)) return;
+    std::vector<uint64_t> all = {ga};
+    uint64_t a = mover;
+    for (int steps = 0; steps < 8192; steps++) {
+        const uint64_t next = r64(a + 0x190);
+        if (!heap(next)) break;
+        a = next - 0x190;
+        if (a == mover || r64(a) != kGameActorVt) break;
+        float p[3];
+        if (a == ga || !game_actor_pos(a, p)) continue;
+        const float dx = p[0] - at[0], dy = p[1] - at[1], dz = p[2] - at[2];
+        if (dx * dx + dy * dy + dz * dz > 1.5f * 1.5f) continue;
+        const std::string other = game_actor_name(a);
+        if (other.find("Parts") != std::string::npos && other.rfind("Obj_", 0) == 0) all.push_back(a);
+    }
+    for (uint64_t x : all) {
+        const uint64_t comps = r64(x + 0x270);
+        const uint64_t body = heap(comps) && (int)r32(x + 0x278) > 87 ? r64(comps + 8 * 87) : 0;
+        const uint64_t life = heap(body) ? r64(body + 0x1c10) : 0;
+        if (heap(life) && (int)r32(life + 8) > 0 && fellow_life_message(c, x, -100000)) continue;
+        guest_call(c, 0x800c6490ULL, x, 0);
+    }
+    log("world: %s taken away here at once, as in another player's game (%zu actor%s)", name.c_str(), all.size(), all.size() == 1 ? "" : "s");
+}
+
+// (another player in this map now)
+bool v_in_map(Session& ses, const char* map) {
+    PlayerState st[kMaxPlayers], prev[kMaxPlayers];
+    bool used[kMaxPlayers];
+    int me = -1;
+    if (!ses.states(st, prev, used, &me)) return false;
+    for (int i = 0; i < kMaxPlayers; i++)
+        if (used[i] && i != me && (st[i].flags & kInPlay) && !strcmp(st[i].map, map)) return true;
+    return false;
 }
 
 // (what object a flag is of: its name, empty when not seen in this map)
@@ -149,6 +207,10 @@ void world_object_hit(uint64_t body, uint32_t before, uint32_t after) {
     const uint64_t placement = placement_of(ga);
     const LocalSnapshot snap = local_snapshot();
     if (!placement || !snap.valid || !snap.map[0]) return;
+    {   // (broken by another player's blast made here: its own game sends that)
+        float p[3];
+        if (game_actor_pos(ga, p) && effects_remote_blast_near(p)) return;
+    }
     ses.send_object_hit(snap.map, name, placement, amount);
     log("world: %s struck here (-%d): sent (%016llx)", name.c_str(), amount, (unsigned long long)placement);
 }
@@ -183,7 +245,7 @@ void world_take_object_hit(Ctx* c, const std::string& map, const std::string& na
     log("world: %s struck in another game: struck here too%s", name.c_str(), blow ? "" : " (not taken)");
 }
 
-void world_update(Ctx*, uint64_t mover, const char* map, bool loading, int64_t now) {
+void world_update(Ctx* c, uint64_t mover, const char* map, bool loading, int64_t now) {
     Session& ses = Session::get();
     if (!ses.active() || loading || !map[0]) return;
     static int64_t next = 0;
@@ -219,6 +281,9 @@ void world_update(Ctx*, uint64_t mover, const char* map, bool loading, int64_t n
         const std::string name = object_of(key_at(i));
         if (!shared_object(name)) {
             if (!name.empty()) log("world: %s changed here: its own to each player (not sent)", name.c_str());
+            // (a chest opened here: the others in this map told that theirs still holds its item)
+            if (name.find("TBox") != std::string::npos && ses.others_present() && v_in_map(ses, map))
+                ses.tell_others(ses.name() + " opened a chest here: yours still holds its item for you", 0);
             continue;
         }
         out.push_back({key_at(i), v});
@@ -245,6 +310,18 @@ void world_update(Ctx*, uint64_t mover, const char* map, bool loading, int64_t n
             continue;
         }
         if (here.count(it->key) || here.count(it->key ^ 2)) {
+            // (in this world now: an object that goes away is taken away at once, its state written; the others wait)
+            auto obj = g_actor_of.find(it->key);
+            if (obj == g_actor_of.end()) obj = g_actor_of.find(it->key ^ 2);
+            const std::string name = obj != g_actor_of.end() ? game_actor_name(obj->second) : std::string();
+            if (obj != g_actor_of.end() && goes_away(name) && it->value != 0) {
+                take_away(c, mover, obj->second, name);
+                const uint32_t v = it->value;
+                poke(arr + 16 * (uint64_t)i + 12, &v, 4);
+                g_seen[(size_t)i] = v;
+                it = g_pending.erase(it);
+                continue;
+            }
             if (!it->told) log("world: %016llx waits: its object is in this world now", (unsigned long long)it->key);
             it->told = true;
             ++it;

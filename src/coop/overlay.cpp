@@ -11,6 +11,7 @@
 
 #include "coop.h"
 #include "dialogs.h"
+#include "effects.h"
 #include "fellow.h"
 #include "game.h"
 #include "imgui.h"
@@ -424,6 +425,59 @@ void draw_toasts(Ui& u, bool sounds) {
 }
 
 // ---- in play: the players' list under the hearts, the nameplates
+bool project(const CameraView& cam, const float p[3], float w, float h, float* sx, float* sy, float* depth);
+
+// the other players' projectiles where they are (effects.h): a seed's glint, a Deku Nut, an arrow's streak, the
+// hookshot's chain; their end as their own burst (a Deku Nut's white flash fills the view when it is near)
+void draw_projectiles(Ui& u) {
+    const CameraView cam = camera_view();
+    if (!cam.valid) return;
+    ImDrawList* dl = u.d;
+    for (const ProjectileView& p : effects_projectiles()) {
+        float sx, sy, d;
+        if (!project(cam, p.pos, u.w, u.h, &sx, &sy, &d)) continue;
+        const float k = std::clamp(12.0f / std::max(d, 0.5f), 0.15f, 6.0f) * u.s;   // (its size by its distance)
+        if (!p.end) {
+            float px, py, pd;
+            const bool trail = project(cam, p.prev, u.w, u.h, &px, &py, &pd);
+            if (p.kind == kProjArrow) {
+                if (trail) dl->AddLine(ImVec2(px, py), ImVec2(sx, sy), rgba(240, 232, 210, 230), std::max(1.5f, 1.2f * k));
+                dl->AddCircleFilled(ImVec2(sx, sy), std::max(1.5f, 1.4f * k), rgba(200, 200, 210, 255));
+            } else if (p.kind == kProjHook) {
+                int slot = p.owner;
+                float hand[3];
+                bool child = false;
+                float hx, hy, hd;
+                if (puppet_position(slot, hand, &child) && (hand[1] += child ? 0.6f : 1.0f, project(cam, hand, u.w, u.h, &hx, &hy, &hd)))
+                    dl->AddLine(ImVec2(hx, hy), ImVec2(sx, sy), rgba(150, 150, 160, 230), std::max(1.5f, 0.8f * k));
+                dl->AddCircleFilled(ImVec2(sx, sy), std::max(2.0f, 1.6f * k), rgba(190, 190, 200, 255));
+            } else {
+                const ImU32 col = p.kind == kProjNut ? rgba(150, 100, 50, 255) : rgba(214, 176, 72, 255);
+                if (trail) dl->AddLine(ImVec2(px, py), ImVec2(sx, sy), fade(col, 0.45f), std::max(1.0f, 1.2f * k));
+                dl->AddCircleFilled(ImVec2(sx, sy), std::max(2.0f, (p.kind == kProjNut ? 2.2f : 1.4f) * k), col);
+                dl->AddCircle(ImVec2(sx, sy), std::max(2.5f, (p.kind == kProjNut ? 2.6f : 1.8f) * k), rgba(255, 240, 200, 120), 0, 1.0f);
+            }
+            continue;
+        }
+        const float t = std::clamp(p.age / (p.kind == kProjNut ? 0.55f : 0.3f), 0.0f, 1.0f);
+        if (p.kind == kProjNut) {
+            // (the nut's flash: a white burst; the whole view whitened a moment when it is near)
+            const float r = (6.0f + 40.0f * t) * k;
+            dl->AddCircleFilled(ImVec2(sx, sy), r, rgba(255, 255, 255, (int)(230 * (1.0f - t))));
+            dl->AddCircle(ImVec2(sx, sy), r * 1.3f, rgba(255, 250, 220, (int)(160 * (1.0f - t))), 0, 3.0f * u.s);
+            if (d < 10.0f) dl->AddRectFilled(ImVec2(0, 0), ImVec2(u.w, u.h), rgba(255, 255, 255, (int)(150 * (1.0f - t) * (1.0f - d / 10.0f))));
+        } else {
+            // (a seed's or an arrow's spark where it hit)
+            for (int i = 0; i < 6; i++) {
+                const float a = i * 1.047f + 0.4f;
+                const float r0 = (1.0f + 3.0f * t) * k, r1 = (2.5f + 6.0f * t) * k;
+                dl->AddLine(ImVec2(sx + cosf(a) * r0, sy + sinf(a) * r0), ImVec2(sx + cosf(a) * r1, sy + sinf(a) * r1),
+                            rgba(255, 220, 140, (int)(230 * (1.0f - t))), std::max(1.0f, 0.6f * k));
+            }
+        }
+    }
+}
+
 bool project(const CameraView& cam, const float p[3], float w, float h, float* sx, float* sy, float* depth) {
     const float* m = cam.m;
     const float vx = m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3];
@@ -893,6 +947,7 @@ void overlay_draw(ImGuiContext* ctx, uint32_t w, uint32_t h) {
     static int64_t play_seen = 0;
     if (game_in_play() && !pause_menu_open()) play_seen = now_ns();
     if (now_ns() - play_seen < 600000000LL && v.role != Role::None) {
+        draw_projectiles(u);
         draw_hud(u, v, gs);
         draw_downed(u);
         draw_revive_prompt(u, v);

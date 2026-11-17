@@ -536,7 +536,7 @@ static int do_uninstall(const wchar_t* folder, int remove_settings, wchar_t* why
 
 // ---------------------------------------------------------------- the window
 
-#define APP_VERSION L"1.1.0 Beta"
+#define APP_VERSION L"1.1.1 Beta"
 #define AUTHOR L"Osama-Alzahrani-UQU"
 #define REPO_URL L"https://github.com/Osama-Alzahrani-UQU/zelda-coop"
 #define PROFILE_URL L"https://github.com/Osama-Alzahrani-UQU"
@@ -686,6 +686,8 @@ static const wchar_t* const kGuide =
     L"- Enemies are shared: hits, reactions, kills and their loot happen in every player's world.\r\n"
     L"- The world is shared: grass, pots and switches live; doors, webs and blocks as they are opened or broken.\r\n"
     L"- Chests are each player's own: everyone opens their own and gets its item.\r\n"
+    L"- Doors a friend opens swing open for you; webs, rocks and locks they break disappear at once.\r\n"
+    L"- Bombs go off in every world; the others' seeds, nuts and arrows are drawn as they fly.\r\n"
     L"- A fallen player waits for a friend to revive them (hold A beside them) or gives up (hold -).\r\n"
     L"- The pause menu does not stop the world while you play together.\r\n"
     L"\r\n"

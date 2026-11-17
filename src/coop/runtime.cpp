@@ -1,4 +1,5 @@
 ﻿#include "runtime.h"
+#include "effects.h"
 #include "fellow.h"
 
 #include <atomic>
@@ -107,6 +108,13 @@ uint64_t pause_entry(uint64_t mgr, uint32_t hash) {
     for (uint32_t i = 0; i < n; i++)
         if (r32(arr + 0x20 * (uint64_t)i + 8) == hash) return arr + 0x20 * (uint64_t)i;
     return 0;
+}
+
+// The actors' messages (f_80393a20: x0 the sender's message part (its GameActor + 0x3e0), x2 {u32 to, u32 kind}): a fire
+// lighting a Deku Stick sends PerformIgniteUseDekuStick (0x76910017) to the one holding it (effects.cpp)
+void hook_send_message(Ctx* c) {
+    if (c->x[2] >= kHeapBase && r32(c->x[2] + 4) == 0x76910017u) effects_stick_lit(c->x[0] - 0x3e0);
+    g_rt.orig_send_message(c);
 }
 
 void hook_pause_request(Ctx* c) {
@@ -236,6 +244,8 @@ bool runtime_init() {
     }
     if (g_rt.a64_lookup)   // (the pause menu online: the world goes on)
         hook((void*)g_rt.a64_lookup(0x80b1ba60ULL), (void*)hook_pause_request, (void**)&g_rt.orig_pause_request, "PauseMgr request");
+    if (g_rt.a64_lookup)   // (a Deku Stick lit by a fire: its flame shown on this player's stick in the others' worlds)
+        hook((void*)g_rt.a64_lookup(0x80393a20ULL), (void*)hook_send_message, (void**)&g_rt.orig_send_message, "actor messages");
     g_rt.exe_ready = ok;
     return ok;
 }

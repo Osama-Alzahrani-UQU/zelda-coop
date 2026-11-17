@@ -126,6 +126,7 @@ struct EnemySnap {
     float home[3] = {0, 0, 0}, pos[3] = {0, 0, 0}, rot[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
     std::vector<uint8_t> pose;
     int64_t got_ms = 0;
+    uint64_t placement = 0;   // (where the map placed it: the same in every game; 0 one made in play)
 };
 
 // A placed object's state shared between games (world.cpp): GameData's object flag (its 64-bit key: the object's
@@ -136,6 +137,17 @@ struct WorldFlag {
 };
 
 // A kill shared between games: an enemy by its actor's name and where it fell, in a map
+// A projectile of a player's in flight (a seed, a Deku Nut, an arrow, the hookshot's tip): where it is, and its end
+struct ProjectileSnap {
+    int owner = -1;
+    uint32_t id = 0;
+    int kind = 0;        // (effects.h: kProjSeed, kProjNut, kProjArrow, kProjHook)
+    bool end = false;    // (gone: it hit, flashed or came back)
+    std::string map;
+    float pos[3] = {0, 0, 0};
+    int64_t got_ms = 0;
+};
+
 struct KillEvent {
     uint32_t id = 0;
     std::string actor;
@@ -213,6 +225,17 @@ public:
     void send_enemy_hit(const std::string& map, const std::string& name, const float home[3], int amount, int owner, uint32_t id);
     // a blow on a placed object here (grass cut, a switch struck, a web burnt): the same object (its placement) in the others'
     void send_object_hit(const std::string& map, const std::string& name, uint64_t placement, int amount);
+    // a blast of this player's (a bomb gone off) at a place: made there in the others' worlds (effects.cpp)
+    void send_effect(const std::string& map, const std::string& name, const float pos[3]);
+    std::vector<GameAction> take_effects();               // (the others' blasts: s "map\nname", pos)
+    // this player's projectiles: where each is (unreliable, often) and its end (reliable); the others', as they come
+    void send_projectile(const std::string& map, uint32_t id, int kind, bool end, const float pos[3]);
+    std::vector<ProjectileSnap> take_projectiles();
+    // a door near this player opening or closing (its placement, its animation): played on the same door in the others'
+    void send_door(const std::string& map, uint64_t placement, const std::string& anim);
+    void send_stick_fire(int seconds);                    // (this player's Deku Stick lit: burning that long, 0 out)
+    bool take_stick_fire(int* slot, int* seconds);        // (another player's stick lit, or out)
+    std::vector<GameAction> take_doors();                 // (the others' doors: s "map\nanimation", key the placement)
     // (the host's game: its starting gear, each item's pouch name and count, for players who join)
     void set_starter(const std::vector<std::pair<std::string, int>>& have);
 
@@ -230,6 +253,7 @@ public:
     std::vector<FriendEntry> friends();
     std::vector<Toast> toasts();
     void toast(const std::string& text, int kind = 0);
+    void tell_others(const std::string& text, int kind = 0);   // (a notice in the other players' games)
     std::vector<KillEvent> kills_for(const std::string& map);
     HostSettings host_settings();
     void set_host_settings(const HostSettings& s);

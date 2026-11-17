@@ -222,15 +222,16 @@ int coopsave_install(const std::vector<uint8_t>& caption, const std::vector<uint
         log("coopsave: this player's saves could not be copied aside: the host's world is not installed");
         return -1;
     }
-    // (into the slot written longest ago: the game's own rolling list; written now, it is the newest, the Load screen's
-    // first row)
+    // (into the slot the game lists first now: its newest. The game reads its list of saves when it starts and keeps it,
+    // so a slot written now is not moved up that list; the first row's slot is loaded from disk as it is now. It was
+    // copied aside above.)
     int slot = -1;
-    int64_t oldest = INT64_MAX;
+    int64_t newest = INT64_MIN;
     for (int s = 0; s < kSlots; s++) {
         WIN32_FILE_ATTRIBUTE_DATA a;
         if (!GetFileAttributesExW((account + L"\\" + slot_name(s) + L"\\caption.sav").c_str(), GetFileExInfoStandard, &a)) continue;
         const int64_t t = ((int64_t)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime;
-        if (t < oldest) oldest = t, slot = s;
+        if (t > newest) newest = t, slot = s;
     }
     if (slot < 0) slot = 0;
     const std::wstring dir = account + L"\\" + slot_name(slot);

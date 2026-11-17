@@ -694,6 +694,33 @@ void take(Shown& sh, const PoseData& in, int64_t now, int64_t frame_ns) {
 }
 }  // namespace
 
+bool pose_actor_tip(uint64_t actor, float length, float out[3]) {
+    Unit u;
+    if (!unit_of(actor, &u, false) || u.skel->count < 1) return false;
+    float w[16], m0[12];
+    if (!peek(u.world, w, sizeof w)) return false;
+    bone_rows(w, m0);
+    float best = 0;
+    for (int i = 1; i < u.skel->count && i < 64; i++) {
+        float b[16];
+        if (!peek(u.world + 0x40 * (uint64_t)i, b, sizeof b)) break;
+        const float dx = b[12] - m0[3], dy = b[13] - m0[7], dz = b[14] - m0[11];
+        const float d = dx * dx + dy * dy + dz * dz;
+        if (d > best && std::isfinite(d)) best = d, out[0] = b[12], out[1] = b[13], out[2] = b[14];
+    }
+    if (best > 0.2f * 0.2f) return true;
+    for (int r = 0; r < 3; r++) out[r] = m0[4 * r + 3] + m0[4 * r + 1] * length;
+    return std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
+}
+
+bool pose_actor_root(uint64_t actor, float out[3]) {
+    Unit u;
+    float w[16];
+    if (!unit_of(actor, &u, false) || !peek(u.world, w, sizeof w)) return false;
+    out[0] = w[12], out[1] = w[13], out[2] = w[14];
+    return std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
+}
+
 bool pose_capture_actor(uint64_t actor, std::vector<uint8_t>* blob) {
     Unit u;
     if (!unit_of(actor, &u, false)) return false;

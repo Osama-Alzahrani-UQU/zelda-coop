@@ -25,6 +25,7 @@
 
 #include "coop.h"
 #include "menus.h"
+#include "effects.h"
 #include "enemies.h"
 #include "fellow.h"
 #include "game.h"
@@ -203,6 +204,15 @@ void run_line(Ctx* c, const std::string& line) {
         for (size_t i = 0; i + 1 < t[2].size(); i += 2) bytes.push_back((uint8_t)strtoul(t[2].substr(i, 2).c_str(), nullptr, 16));
         poke(a, bytes.data(), bytes.size());
         log("probe: wrote %zu bytes at %#llx", bytes.size(), (unsigned long long)a);
+    } else if (t[0] == "dests") {
+        // dests: the runtime's debug teleport destinations (child map, adult map)
+        std::string all;
+        for (int i = 0; i < 64 && rt().hos_oot_destination; i++) {
+            const char *cm = nullptr, *am = nullptr;
+            if (!rt().hos_oot_destination(i, &cm, &am)) break;
+            all += std::to_string(i) + ":" + (cm ? cm : "-") + "/" + (am ? am : "-") + " ";
+        }
+        log("probe: dests %s", all.c_str());
     } else if (t[0] == "goto" && t.size() >= 2) {
         // goto MAP: the runtime's debug teleport to that map's destination (as the trip to the host takes)
         const LocalSnapshot s = local_snapshot();
@@ -220,6 +230,38 @@ void run_line(Ctx* c, const std::string& line) {
     } else if (t[0] == "ekill" && t.size() >= 2) {
         // ekill GAMEACTOR: that enemy brought down by a blow of the game's own (a life message), as another game's kill is
         log("probe: ekill %s %s", t[1].c_str(), fellow_kill_actor(c, strtoull(t[1].c_str(), nullptr, 16)) ? "sent" : "not taken");
+    } else if (t[0] == "spawnfx" && t.size() >= 2) {
+        // spawnfx NAME [UP]: that actor made (and put in the world) 2 m in front of Link, UP metres up; its fate logged
+        effects_test_spawn(t[1], t.size() > 2 ? (float)atof(t[2].c_str()) : 1.0f);
+        log("probe: spawnfx %s", t[1].c_str());
+    } else if (t[0] == "edel" && t.size() >= 2) {
+        // edel GAMEACTOR: that actor deleted as the scripts' OneShotGenericDeleteThisActor does (f_800c6490(actor, 0))
+        const uint64_t ga = strtoull(t[1].c_str(), nullptr, 16);
+        log("probe: edel %s -> %llu", t[1].c_str(), (unsigned long long)(guest_call(c, 0x800c6490ULL, ga, 0) & 1));
+    } else if (t[0] == "asact" && t.size() >= 3) {
+        // asact GAMEACTOR NAME: that animation (AS) played on that actor, as a door's for another player
+        log("probe: asact %s %s -> %d", t[1].c_str(), t[2].c_str(),
+            (int)game_play_as(c, strtoull(t[1].c_str(), nullptr, 16), t[2].c_str(), 1.0f, false));
+    } else if (t[0] == "xlink" && t.size() >= 3) {
+        // xlink GAMEACTOR KEY [MODE]: an effect key played on that actor as the scripts do (its effect part f_804d8220(actor),
+        // then f_83bf69e0(&part, &key, 0, mode))
+        static uint64_t buf = 0;
+        if (!buf) buf = guest_alloc(0x80, 16);
+        const uint64_t ga = strtoull(t[1].c_str(), nullptr, 16);
+        const uint64_t part = buf ? guest_call(c, 0x804d8220ULL, ga) : 0;
+        if (part && t[2].size() < 60) {
+            w64(buf, part);
+            poke(buf + 0x20, t[2].c_str(), t[2].size() + 1);
+            w64(buf + 8, buf + 0x20);
+            const uint64_t r = guest_call(c, 0x83bf69e0ULL, buf, buf + 8, 0, t.size() > 3 ? strtoull(t[3].c_str(), nullptr, 10) : 0);
+            log("probe: xlink %s %s -> part %#llx, %#llx", t[1].c_str(), t[2].c_str(), (unsigned long long)part, (unsigned long long)r);
+        } else {
+            log("probe: xlink %s: no effect part", t[1].c_str());
+        }
+    } else if (t[0] == "stickfire" && t.size() >= 2) {
+        // stickfire SECONDS: this player's Deku Stick as lit (its fire shown on it in the others' worlds)
+        effects_test_stick(atoi(t[1].c_str()));
+        log("probe: stickfire %s", t[1].c_str());
     } else if (t[0] == "eblow" && t.size() >= 3) {
         // eblow GAMEACTOR N: a blow of N on that enemy as the game's own (seen by the life hook: shared as a player's hit is)
         log("probe: eblow %s %s %s", t[1].c_str(), t[2].c_str(),

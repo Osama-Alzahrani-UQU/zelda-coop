@@ -85,8 +85,12 @@ uint64_t game_actor_life(uint64_t ga) {
     if (!heap(comps) || (int)r32(ga + 0x278) <= kBodyComponent) return 0;
     const uint64_t body = r64(comps + 8 * kBodyComponent);
     if (!heap(body) || r64(body) != kActorBodyVt || r64(body + 24) != ga) return 0;
+    // (its life object: the body's +0x1c10, the value at +8, as the body's own damage step (f_804bd8c0) reads it. Its
+    // +0x28 is not always the actor (grass: 0; some enemies too): not asked, or those would never be shared)
     const uint64_t life = r64(body + 0x1c10);
-    if (!heap(life) || r64(life + 0x28) != ga) return 0;
+    if (!heap(life) || !guest_ok(life, 0x20)) return 0;
+    const int32_t v = (int32_t)r32(life + 8);
+    if (v < -100000 || v > 1000000) return 0;
     return life + 8;
 }
 
@@ -140,23 +144,24 @@ bool fellow_life_message(Ctx* c, uint64_t ga, int change) {
     return true;
 }
 
-void fellow_enemy_died(uint64_t body) {
+void fellow_enemy_died(uint64_t body) { fellow_enemy_died_actor(game_actor_of(body)); }
+
+bool fellow_enemy_died_actor(uint64_t ga) {
     Session& ses = Session::get();
-    if (!ses.active()) return;
-    const uint64_t ga = game_actor_of(body);
-    if (!ga) return;
-    if (kill_seen(ga, true)) return;
+    if (!ses.active() || !ga) return false;
+    if (kill_seen(ga, true)) return false;   // (sent already, or another game's kill)
     const std::string name = game_actor_name(ga);
-    if (name.rfind("Enemy_", 0) != 0) return;   // (enemies and bosses: not pots, grass or the players)
+    if (name.rfind("Enemy_", 0) != 0) return false;   // (enemies and bosses: not pots, grass or the players)
     KillEvent k;
     k.actor = name;
     game_actor_pos(ga, k.home);
     for (int i = 0; i < 3; i++) k.spawn[i] = rf(ga + 0x2ec + 4 * (uint64_t)i);
     k.has_spawn = std::isfinite(k.spawn[0]) && std::isfinite(k.spawn[1]) && std::isfinite(k.spawn[2]);
     k.map = local_snapshot().map;
-    if (k.map.empty()) return;
+    if (k.map.empty()) return false;
     log("kill: %s at %.1f %.1f %.1f in %s", name.c_str(), k.home[0], k.home[1], k.home[2], k.map.c_str());
     ses.kill_happened(k);
+    return true;
 }
 
 namespace {

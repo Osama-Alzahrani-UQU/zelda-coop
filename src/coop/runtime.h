@@ -49,6 +49,7 @@ struct Runtime {
     int (*orig_hearts_enabled)() = nullptr;
     int (*orig_is_player)(Ctx* c, uint64_t actor) = nullptr;
     void (*orig_pause_request)(Ctx* c) = nullptr;   // (the game's PauseMgr request, f_80b1ba60, as lifted)
+    void (*orig_send_message)(Ctx* c) = nullptr;    // (the actors' message send, f_80393a20, as lifted)
     bool exe_ready = false, vk_ready = false;
 };
 

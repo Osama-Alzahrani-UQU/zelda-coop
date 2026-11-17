@@ -2,6 +2,33 @@
 
 All versions of Longshot Co-op by [Osama-Alzahrani-UQU](https://github.com/Osama-Alzahrani-UQU).
 
+## 1.1.1 Beta (2026-11-17)
+
+### Fixes
+- **Guests really load the host's world**: the host's save is written into the save slot the guest's game lists first
+  (the game keeps its list of saves from when it starts), so the guest no longer ends up in their own save.
+- **No more invisible or doubled enemies**: the stand-in enemies (made when another game had an enemy this game had not)
+  are gone; they were unseen, kept fighting and came back. The same enemy is now paired in every game by where the map
+  placed it.
+- **Every enemy is shared now**: enemies whose life the game keeps another way were never shared before (Bari, Biri,
+  Shabom, Tektites, Wallmaster, the Lost Woods stage Scrubs); their moves, hits and deaths now reach every game, the Biri
+  a Bari splits into included.
+- **No enemy left out in a full room**: every enemy near another player is sent (the nearest each moment, the others in
+  turn, each one several times a second); before, only the 8 nearest were.
+- A death the game makes without its usual damage step is now caught and shared too.
+- Room for every player's enemies (up to 256 at once): with 3 or 4 players some enemies were dropped.
+- Two games can no longer run the same enemy at once and copy each other (it stood still, then jumped).
+- **Bosses no longer get stuck in walls**: each game runs its own boss (hits and the defeat are still shared).
+- The menus (item wheel, pause menu) keep the world going while another player is in the session.
+- Both players need this version: a host refuses a friend with another one.
+
+### Added
+- Doors another player opens swing open in your world with their own animation.
+- Webs, rocks, cracked walls and locks another player breaks disappear in your world at once.
+- Bombs go off in every world with their real blast; the other players' seeds, Deku Nuts, arrows and hookshot are drawn
+  as they fly, with a nut's flash and a spark where a shot hits.
+- A friend opening a chest in your room tells you that yours still holds its item.
+
 ## 1.1.0 Beta (2026-11-17)
 
 ### Hosting and joining
